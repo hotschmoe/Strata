@@ -43,7 +43,7 @@ void ep_push(const int32_t* ids, int n_ids, const uint8_t* xq, size_t xq_bytes, 
         for (size_t i = lid; i < words; i += WG) d[i] = s[i];
         // every work-item's stores into the peer before the flag
         sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-        sycl::group_barrier(it.get_group());
+        sycl::group_barrier(it.get_group(), sycl::memory_scope::system);
         if (lid == 0) sys_store(peer_flag, *ctr);
     });
 }
