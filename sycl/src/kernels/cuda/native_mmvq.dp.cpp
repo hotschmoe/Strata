@@ -2251,8 +2251,24 @@ inline bool night_mmvq() {
     }();
     return v;
 }
-int g_night_mmvq_override = -1;   // bench toggle (native_mmvq_set_night): -1 = the env latch
-inline bool night_mmvq_on() { return g_night_mmvq_override >= 0 ? g_night_mmvq_override != 0 : night_mmvq(); }
+// STRATA_NIGHT_MMVQ2=1 (implies STRATA_NIGHT_MMVQ=1): round 2 - software-pipelined persistent KREG at 5-12 columns,
+// ncols 9-16 (direct up to 12 where measured, else two calls of <= 8 columns), IQ3_S / IQ4_NL / Q8_0 where added.
+inline bool night_mmvq2() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_NIGHT_MMVQ2");
+        const bool on = e && e[0] == '1';
+        if (on) std::fprintf(stderr, "strata night mmvq2: enabled=1 pipelined KREG nc5-12, ncols 9-16, IQ3_S, IQ4_NL (implies STRATA_NIGHT_MMVQ=1)\n");
+        return on;
+    }();
+    return v;
+}
+int g_night_mmvq_override = -1;   // bench toggle (native_mmvq_set_night): -1 = the env latches, 0 off, 1 round 1, 2 round 1+2
+inline int night_level() {
+    if (g_night_mmvq_override >= 0) return g_night_mmvq_override;
+    return night_mmvq2() ? 2 : night_mmvq() ? 1 : 0;
+}
+inline bool night_mmvq_on() { return night_level() >= 1; }
+inline bool night_mmvq2_on() { return night_level() >= 2; }
 
 template <int O, int N, int P>
 __dpct_inline__ void night_tsum(float (&v)[P], const sycl::sub_group& sg, int lane) {
@@ -2314,6 +2330,18 @@ struct NightQ4K {
         return r;
     }
     static float dot(const W& r, const A& v) { return night_dot_k(r, v); }
+    // round 2 (pipelined kernel): raw loads now, decode one tile later
+    struct Raw { sycl::int4 hdr, q; };
+    static Raw fetch(const Block* b, int g) {
+        Raw w; w.hdr = *reinterpret_cast<const sycl::int4*>(b); w.q = reinterpret_cast<const sycl::int4*>(b->qs)[g]; return w;
+    }
+    static W decode(const Raw& w, int g, const uint32_t*) {
+        W r; const sycl::int4 q = w.q;
+        r.lo = sycl::int4(q.x() & 0x0f0f0f0f, q.y() & 0x0f0f0f0f, q.z() & 0x0f0f0f0f, q.w() & 0x0f0f0f0f);
+        r.hi = sycl::int4((q.x() >> 4) & 0x0f0f0f0f, (q.y() >> 4) & 0x0f0f0f0f, (q.z() >> 4) & 0x0f0f0f0f, (q.w() >> 4) & 0x0f0f0f0f);
+        night_scales_k(w.hdr, g, r);
+        return r;
+    }
 };
 struct NightQ5K {
     static constexpr int kTableWords = 0;
@@ -2335,6 +2363,21 @@ struct NightQ5K {
         return r;
     }
     static float dot(const W& r, const A& v) { return night_dot_k(r, v); }
+    struct Raw { sycl::int4 hdr, q, h; };
+    static Raw fetch(const Block* b, int g) {
+        Raw w; w.hdr = *reinterpret_cast<const sycl::int4*>(b); w.q = reinterpret_cast<const sycl::int4*>(b->qs)[g];
+        w.h = reinterpret_cast<const sycl::int4*>(b->qh)[g & 1]; return w;
+    }
+    static W decode(const Raw& w, int g, const uint32_t*) {
+        W r; const int sb = 2 * (g >> 1); const sycl::int4 q = w.q, h = w.h;
+        auto hb = [](int v, int bit) { return ((v >> bit) & 0x01010101) << 4; };
+        r.lo = sycl::int4((q.x() & 0x0f0f0f0f) | hb(h.x(), sb), (q.y() & 0x0f0f0f0f) | hb(h.y(), sb),
+                          (q.z() & 0x0f0f0f0f) | hb(h.z(), sb), (q.w() & 0x0f0f0f0f) | hb(h.w(), sb));
+        r.hi = sycl::int4(((q.x() >> 4) & 0x0f0f0f0f) | hb(h.x(), sb + 1), ((q.y() >> 4) & 0x0f0f0f0f) | hb(h.y(), sb + 1),
+                          ((q.z() >> 4) & 0x0f0f0f0f) | hb(h.z(), sb + 1), ((q.w() >> 4) & 0x0f0f0f0f) | hb(h.w(), sb + 1));
+        night_scales_k(w.hdr, g, r);
+        return r;
+    }
 };
 struct NightQ6K {   // the wide Q6_K kernel's lane mapping and dot expression; (q - 32) per byte by the CENTER identity
     static constexpr int kTableWords = 0;
@@ -2374,6 +2417,39 @@ struct NightQ6K {   // the wide Q6_K kernel's lane mapping and dot expression; (
         s1 = strata::dp4a(r.vi1[2], a.u1.z(), s1); s1 = strata::dp4a(r.vi1[3], a.u1.w(), s1);
         return a.ds0 * r.dsc0 * (float) s0 + a.ds1 * r.dsc1 * (float) s1;
     }
+    // round 2 (pipelined, matrix base % 4 == 0 and an even block count per row, so a block starts at 0 or 2 mod 4):
+    // 5 + 5 dword loads per row-lane, the 16-bit funnel shift in decode
+    struct Raw { uint32_t l[5], h[5]; uint32_t hb; int s0, s1; float d; };
+    static Raw fetch(const Block* b, int g) {
+        Raw r;
+        const int qh4_idx = 2 * (g >> 2) + (g & 1), scale_offset = 8 * (g >> 2) + (g & 3);
+        const uintptr_t al = reinterpret_cast<uintptr_t>(b->ql + 16 * g), ah = reinterpret_cast<uintptr_t>(b->qh + 16 * qh4_idx);
+        const uint32_t* ql = reinterpret_cast<const uint32_t*>(al & ~uintptr_t(3));
+        const uint32_t* qh = reinterpret_cast<const uint32_t*>(ah & ~uintptr_t(3));
+#pragma unroll
+        for (int i = 0; i < 5; ++i) { r.l[i] = ql[i]; r.h[i] = qh[i]; }   // the 5th dword ends inside the block
+        r.hb = (uint32_t) ((al & 2) | ((ah & 2) >> 1));
+        r.s0 = b->scales[scale_offset]; r.s1 = b->scales[scale_offset + 4]; r.d = b->d;
+        return r;
+    }
+    static W decode(const Raw& w, int g, const uint32_t*) {
+        W r;
+        const int vh_shift = 2 * ((g & 3) >> 1);
+        const bool hl = (w.hb & 2) != 0, hh = (w.hb & 1) != 0;
+        int vl[4], vh[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            vl[i] = (int) (hl ? (w.l[i] >> 16) | (w.l[i + 1] << 16) : w.l[i]);
+            vh[i] = (int) (hh ? (w.h[i] >> 16) | (w.h[i + 1] << 16) : w.h[i]) >> vh_shift;
+        }
+        r.dsc0 = w.d * (float) w.s0; r.dsc1 = w.d * (float) w.s1;
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            r.vi0[p] = (int) ((uint32_t((vl[p] & 0x0f0f0f0f) | ((vh[p] << 4) & 0x30303030)) + 0x60606060u) ^ 0x80808080u);
+            r.vi1[p] = (int) ((uint32_t(((vl[p] >> 4) & 0x0f0f0f0f) | (((vh[p] >> 4) << 4) & 0x30303030)) + 0x60606060u) ^ 0x80808080u);
+        }
+        return r;
+    }
 };
 // IQ4_XS (lane g = sub-block g, as WideIQ4XS): the codebook through a 256-entry SLM table indexed by a qs byte,
 // TL[b] = code(b & 15) | code(b >> 4) << 16, so two lookups and two shifts give four low and four high codes.
@@ -2410,6 +2486,27 @@ struct NightIQ4XS {
         return r;
     }
     static float dot(const W& r, const A& v) { return r.d * v.ds * (float) dp4a4(r.hi, v.u1, dp4a4(r.lo, v.u0, 0)); }
+    struct Raw { sycl::int2 hdr, qa, qb; };
+    static Raw fetch(const Block* b, int g) {
+        Raw w; w.hdr = *reinterpret_cast<const sycl::int2*>(b);
+        const sycl::int2* q2 = reinterpret_cast<const sycl::int2*>(b->qs + 16 * g); w.qa = q2[0]; w.qb = q2[1]; return w;
+    }
+    static W decode(const Raw& w, int g, const uint32_t* tl) {
+        W r;
+        const uint32_t v[4] = {(uint32_t) w.qa.x(), (uint32_t) w.qa.y(), (uint32_t) w.qb.x(), (uint32_t) w.qb.y()};
+        int lo[4], hi[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t P = tl[v[i] & 0xFF] | (tl[(v[i] >> 8) & 0xFF] << 8);
+            const uint32_t Q = tl[(v[i] >> 16) & 0xFF] | (tl[v[i] >> 24] << 8);
+            lo[i] = (int) ((P & 0xFFFFu) | (Q << 16)); hi[i] = (int) ((P >> 16) | (Q & 0xFFFF0000u));
+        }
+        r.lo = sycl::int4(lo[0], lo[1], lo[2], lo[3]); r.hi = sycl::int4(hi[0], hi[1], hi[2], hi[3]);
+        const uint32_t h0 = (uint32_t) w.hdr.x(), sl = (uint32_t) w.hdr.y();
+        const int ls = (int) (((sl >> (8 * (g >> 1) + 4 * (g & 1))) & 0x0f) | (((h0 >> (16 + 2 * g)) & 0x03) << 4));
+        r.d = (float) sycl::bit_cast<sycl::half>((uint16_t) (h0 & 0xFFFF)) * (float) (ls - 32);
+        return r;
+    }
 };
 template <int R, int NCOLS> constexpr int night_p() { return (R * NCOLS + NIGHT_SG - 1) / NIGHT_SG * NIGHT_SG; }
 template <typename F, int NCOLS, int R>
@@ -2490,6 +2587,130 @@ void launch_night_kreg(const void* weights, const void* x_q8_1, float* y, int n_
             h.parallel_for<dpct_kernel_name<class night_mmvq_kreg, F, dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<R>>>(nr, k);
     });
 }
+// Round 2: the same mapping on a persistent grid (one group per resident slot), the NEXT tile's raw weight loads issued
+// before this tile's decode + dots (the round-1 kernel serializes act-load -> weight-load -> math per group: Q4_K nc6
+// qkv 28.4 us with the matrix in L2 vs 40.3 us from DRAM). Same lanes, butterfly and SLM order as night_kreg_kernel:
+// bitwise equal to it for the same (NCOLS, R).
+template <typename F, int NCOLS, int R>
+void night_pf_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
+                     int n_in, int n_out, float* __restrict__ slm) {
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<1>();
+    const sycl::sub_group sg = it.get_sub_group();
+    constexpr int P0 = R * NCOLS, P = night_p<R, NCOLS>(), PL = P / NIGHT_SG;
+    const int lid = int(it.get_local_id(0)), lane = int(sg.get_local_linear_id()), sgi = lid / NIGHT_SG;
+    const int nsg = int(it.get_local_range(0)) / NIGHT_SG;
+    const int bpr = n_in / QK, x_stride = n_in / Q8K;
+    const bool live = (lid >> 3) < bpr;
+    const int kb = live ? (lid >> 3) : 0, g = lid & 7;
+    const int ntiles = (n_out + R - 1) / R, step = int(it.get_group_range(0));
+    int t = int(it.get_group(0));
+    if (t >= ntiles) return;   // whole group
+    const uint32_t* tbl = nullptr;
+    if constexpr (F::kTableWords > 0) {
+        uint32_t* tw = reinterpret_cast<uint32_t*>(slm + 2 * nsg * P);
+        for (int i = lid; i < F::kTableWords; i += int(it.get_local_range(0))) tw[i] = F::table_entry(i);
+        it.barrier(sycl::access::fence_space::local_space);
+        tbl = tw;
+    }
+    auto fetch_tile = [&](int tt, typename F::Raw (&raw)[R]) {
+        const int row0 = tt * R, rlast = n_out - 1 - row0;
+        const typename F::Block* wt = w + std::size_t(row0) * bpr + kb;
+#pragma unroll
+        for (int r = 0; r < R; ++r) raw[r] = F::fetch(wt + (r < rlast ? r : rlast) * bpr, g);
+    };
+    typename F::Raw cur[R];
+    fetch_tile(t, cur);   // the first tile's weights are in flight while the activations load
+    typename F::A a[NCOLS];
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        a[j] = F::act(x + std::size_t(j) * x_stride + kb * (QK / Q8K), g);
+        if (!live) a[j] = typename F::A{};
+    }
+    int buf = 0;
+    for (;;) {
+        const int row0 = t * R, tn = t + step;
+        typename F::Raw nxt[R];
+        if (tn < ntiles) fetch_tile(tn, nxt);
+        float v[P];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const typename F::W wv = F::decode(cur[r], g, tbl);
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) v[r * NCOLS + j] = F::dot(wv, a[j]);
+        }
+#pragma unroll
+        for (int k = P0; k < P; ++k) v[k] = 0.0f;
+        night_tsum<NIGHT_SG / 2, P, P>(v, sg, lane);
+        float* b = slm + buf * nsg * P;
+#pragma unroll
+        for (int i = 0; i < PL; ++i) b[sgi * P + lane * PL + i] = v[i];
+        it.barrier(sycl::access::fence_space::local_space);
+        for (int k = lid; k < P0; k += int(it.get_local_range(0))) {
+            float sum = 0.0f;
+            for (int q = 0; q < nsg; ++q) sum += b[q * P + k];
+            const int r = k / NCOLS, j = k % NCOLS;
+            if (row0 + r < n_out) y[std::size_t(j) * n_out + row0 + r] = sum;
+        }
+        buf ^= 1;
+        if (tn >= ntiles) break;
+        t = tn;
+#pragma unroll
+        for (int r = 0; r < R; ++r) cur[r] = nxt[r];
+    }
+}
+inline int night_xe_cores(dpct::queue_ptr s) {   // B70: 256 compute units = 32 Xe-cores x 8 XVE
+    static const int v = std::max(1, int(s->get_device().get_info<sycl::info::device::max_compute_units>()) / 8);
+    return v;
+}
+template <typename F, int NCOLS, int R, int GRF>
+void launch_night_pf(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, dpct::queue_ptr s) {
+    const auto* w = static_cast<const typename F::Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const int L = ((n_in / QK) * 8 + NIGHT_SG - 1) / NIGHT_SG * NIGHT_SG;
+    const int nsg = L / NIGHT_SG;
+    constexpr int P = night_p<R, NCOLS>();
+    const int tiles = (n_out + R - 1) / R;
+    // one group per resident slot: 8 XVE x (8 threads at GRF128, 4 at GRF256) per Xe-core
+    const int cap = night_xe_cores(s) * std::max(1, (GRF == 256 ? 32 : 64) / nsg);
+    const int groups = std::min(tiles, cap);
+    s->submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> slm(sycl::range<1>(2 * nsg * P + F::kTableWords), h);
+        auto k = [=](sycl::nd_item<1>) [[sycl::reqd_sub_group_size(16)]] {
+            night_pf_kernel<F, NCOLS, R>(w, x, y, n_in, n_out, slm.get_multi_ptr<sycl::access::decorated::no>().get());
+        };
+        const sycl::nd_range<1> nr(std::size_t(groups) * L, L);
+        if constexpr (GRF == 256)
+            h.parallel_for<dpct_kernel_name<class night_mmvq_pf_g, F, dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<R>>>(
+                nr, sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>}, k);
+        else
+            h.parallel_for<dpct_kernel_name<class night_mmvq_pf, F, dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<R>>>(nr, k);
+    });
+}
+// Round-2 choices (probe r2_pf.txt / r2_wide.txt, card 1): only for n_in <= 4096 (the 6144-wide projections keep the
+// round-1 tiles: 12-thread groups fit badly at GRF256 and the pipelined kernel did not win there).
+template <typename F, int NCOLS>
+bool night_dispatch2(const void* w, const void* x, float* y, int n_in, int n_out, dpct::queue_ptr s) {
+    if (n_in > 4096) return false;
+    if constexpr (std::is_same_v<F, NightQ6K>) {   // 6-8 columns, A4 raw loads (engine A/B: nc6 -3..-7%, nc8 -9..-13%; nc5 slower)
+        if constexpr (NCOLS < 6 || NCOLS > 8) return false;
+        else {
+            if ((reinterpret_cast<uintptr_t>(w) & 3u) != 0 || (n_in / QK) % 2 != 0) return false;
+            launch_night_pf<F, NCOLS, 2, 256>(w, x, y, n_in, n_out, s);
+            return true;
+        }
+    } else if constexpr (std::is_same_v<F, NightIQ4XS>) {
+        if constexpr (NCOLS <= 4) return false;
+        else if constexpr (NCOLS <= 6) launch_night_pf<F, NCOLS, 2, 128>(w, x, y, n_in, n_out, s);
+        else if constexpr (NCOLS <= 8) launch_night_pf<F, NCOLS, 4, 256>(w, x, y, n_in, n_out, s);
+        else launch_night_pf<F, NCOLS, 2, 256>(w, x, y, n_in, n_out, s);
+        return true;
+    } else {   // Q4_K, Q5_K
+        if constexpr (NCOLS <= 4 || NCOLS > 12) return false;
+        else if constexpr (NCOLS <= 8) launch_night_pf<F, NCOLS, 4, 256>(w, x, y, n_in, n_out, s);
+        else launch_night_pf<F, NCOLS, 2, 256>(w, x, y, n_in, n_out, s);
+        return true;
+    }
+}
 // Per-(format, columns) tile shape from the probe sweep (mmvq_probe, card 1, 2026-10-16): R rows per tile, GRF mode.
 template <typename F, int NCOLS>
 void night_dispatch(const void* w, const void* x, float* y, int n_in, int n_out, dpct::queue_ptr s) {
@@ -2512,23 +2733,361 @@ void night_dispatch(const void* w, const void* x, float* y, int n_in, int n_out,
         } else launch_night_kreg<F, NCOLS, 8, 256>(w, x, y, n_in, n_out, s);
     }
 }
+// Runs the night kernels for any 1 <= ncols <= 16 (16 only at level 2); no eligibility checks (try_night does them).
+template <typename F>
+void night_run(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, dpct::queue_ptr s, bool lv2) {
+    if (lv2 && ncols >= 5) {
+        bool done = false;
+        switch (ncols) {
+            case 5: done = night_dispatch2<F, 5>(weights, x_q8_1, y, n_in, n_out, s); break;
+            case 6: done = night_dispatch2<F, 6>(weights, x_q8_1, y, n_in, n_out, s); break;
+            case 7: done = night_dispatch2<F, 7>(weights, x_q8_1, y, n_in, n_out, s); break;
+            case 8: done = night_dispatch2<F, 8>(weights, x_q8_1, y, n_in, n_out, s); break;
+            case 9: done = night_dispatch2<F, 9>(weights, x_q8_1, y, n_in, n_out, s); break;
+            case 10: done = night_dispatch2<F, 10>(weights, x_q8_1, y, n_in, n_out, s); break;
+            case 11: done = night_dispatch2<F, 11>(weights, x_q8_1, y, n_in, n_out, s); break;
+            case 12: done = night_dispatch2<F, 12>(weights, x_q8_1, y, n_in, n_out, s); break;
+            case 13: done = night_dispatch2<F, 13>(weights, x_q8_1, y, n_in, n_out, s); break;
+            case 14: done = night_dispatch2<F, 14>(weights, x_q8_1, y, n_in, n_out, s); break;
+            case 15: done = night_dispatch2<F, 15>(weights, x_q8_1, y, n_in, n_out, s); break;
+            case 16: done = night_dispatch2<F, 16>(weights, x_q8_1, y, n_in, n_out, s); break;
+            default: break;
+        }
+        if (done) return;
+        if (ncols > 8) {   // two calls of ceil(n/2) and floor(n/2) columns - the weights are read twice
+            const int c0 = (ncols + 1) / 2;
+            const Q81Block* xb = static_cast<const Q81Block*>(x_q8_1);
+            night_run<F>(weights, xb, y, n_in, n_out, c0, s, lv2);
+            night_run<F>(weights, xb + std::size_t(c0) * (n_in / Q8K), y + std::size_t(c0) * n_out, n_in, n_out, ncols - c0, s, lv2);
+            return;
+        }
+    }
+    switch (ncols) {
+        case 1: night_dispatch<F, 1>(weights, x_q8_1, y, n_in, n_out, s); return;
+        case 2: night_dispatch<F, 2>(weights, x_q8_1, y, n_in, n_out, s); return;
+        case 3: night_dispatch<F, 3>(weights, x_q8_1, y, n_in, n_out, s); return;
+        case 4: night_dispatch<F, 4>(weights, x_q8_1, y, n_in, n_out, s); return;
+        case 5: night_dispatch<F, 5>(weights, x_q8_1, y, n_in, n_out, s); return;
+        case 6: night_dispatch<F, 6>(weights, x_q8_1, y, n_in, n_out, s); return;
+        case 7: night_dispatch<F, 7>(weights, x_q8_1, y, n_in, n_out, s); return;
+        default: night_dispatch<F, 8>(weights, x_q8_1, y, n_in, n_out, s); return;
+    }
+}
 template <typename F>
 bool try_night(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
-    if (!night_mmvq_on() || ncols < 1 || ncols > 8 || n_out <= 0 || n_in <= 0 || n_in % QK != 0 || n_in > 32768) return false;
+    const bool lv2 = night_mmvq2_on();
+    if (!night_mmvq_on() || ncols < 1 || ncols > (lv2 ? 16 : 8) || n_out <= 0 || n_in <= 0 || n_in % QK != 0 || n_in > 32768) return false;
     if ((std::is_same_v<F, NightQ4K> || std::is_same_v<F, NightQ5K>) && (reinterpret_cast<uintptr_t>(weights) & 15u) != 0) return false;
     if (std::is_same_v<F, NightIQ4XS> && (reinterpret_cast<uintptr_t>(weights) & 7u) != 0) return false;
     if (std::is_same_v<F, NightIQ4XS> && ncols == 1 && n_out < 2048) return false;   // measured 0.91-0.97x there
+    if (!weights || !x_q8_1 || !y || !stream) return false;
     if ((reinterpret_cast<uintptr_t>(weights) & 1u) != 0 || (reinterpret_cast<uintptr_t>(x_q8_1) & 3u) != 0) return false;
+    night_run<F>(weights, x_q8_1, y, n_in, n_out, ncols, strata::q_of(stream), lv2);
+    return true;
+}
+
+// ---------------------------------------------------------------- night round 2 (STRATA_NIGHT_MMVQ2=1): IQ3_S, IQ4_NL
+// From the probe2 helper (mmvq_work/probe2/kern_night2.hpp, measured vs verbatim serving baselines): IQ3_S dense with the
+// lane = sub-block mapping and the iq3s grid in a per-group SLM table (sign masks by shifts, no 32-bit multiplies);
+// IQ4_NL (shared-expert down 640 -> 2560) one lane per 32-value block (lanes padded to 16), select-chain codebook.
+struct NightIQ3SBlock {   // = ggml block_iq3_s (3.4375 bpw)
+    sycl::half d;
+    uint8_t qs[64];
+    uint8_t qh[8];
+    uint8_t signs[32];
+    uint8_t scales[4];
+};
+static_assert(sizeof(NightIQ3SBlock) == 110 && alignof(NightIQ3SBlock) == 2 && offsetof(NightIQ3SBlock, qh) == 66 &&
+              offsetof(NightIQ3SBlock, signs) == 74 && offsetof(NightIQ3SBlock, scales) == 106, "NightIQ3SBlock layout");
+static constexpr uint32_t kNightIq3sGrid[512] = {   // = ggml iq3s_grid (every byte odd, 1..15: no zero bytes)
+    0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
+    0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,
+    0x0101090b, 0x0101090f, 0x01010b03, 0x01010b07, 0x01010d01, 0x01010d05, 0x01010f03, 0x01010f09,
+    0x01010f0f, 0x01030101, 0x01030103, 0x01030105, 0x01030109, 0x01030301, 0x01030303, 0x0103030b,
+    0x01030501, 0x01030507, 0x0103050f, 0x01030703, 0x0103070b, 0x01030909, 0x01030d03, 0x01030d0b,
+    0x01030f05, 0x01050101, 0x01050103, 0x0105010b, 0x0105010f, 0x01050301, 0x01050307, 0x0105030d,
+    0x01050503, 0x0105050b, 0x01050701, 0x01050709, 0x01050905, 0x0105090b, 0x0105090f, 0x01050b03,
+    0x01050b07, 0x01050f01, 0x01050f07, 0x01070107, 0x01070303, 0x0107030b, 0x01070501, 0x01070505,
+    0x01070703, 0x01070707, 0x0107070d, 0x01070909, 0x01070b01, 0x01070b05, 0x01070d0f, 0x01070f03,
+    0x01070f0b, 0x01090101, 0x01090307, 0x0109030f, 0x01090503, 0x01090509, 0x01090705, 0x01090901,
+    0x01090907, 0x01090b03, 0x01090f01, 0x010b0105, 0x010b0109, 0x010b0501, 0x010b0505, 0x010b050d,
+    0x010b0707, 0x010b0903, 0x010b090b, 0x010b090f, 0x010b0d0d, 0x010b0f07, 0x010d010d, 0x010d0303,
+    0x010d0307, 0x010d0703, 0x010d0b05, 0x010d0f03, 0x010f0101, 0x010f0105, 0x010f0109, 0x010f0501,
+    0x010f0505, 0x010f050d, 0x010f0707, 0x010f0b01, 0x010f0b09, 0x03010101, 0x03010103, 0x03010105,
+    0x03010109, 0x03010301, 0x03010303, 0x03010307, 0x0301030b, 0x0301030f, 0x03010501, 0x03010505,
+    0x03010703, 0x03010709, 0x0301070d, 0x03010b09, 0x03010b0d, 0x03010d03, 0x03010f05, 0x03030101,
+    0x03030103, 0x03030107, 0x0303010d, 0x03030301, 0x03030309, 0x03030503, 0x03030701, 0x03030707,
+    0x03030903, 0x03030b01, 0x03030b05, 0x03030f01, 0x03030f0d, 0x03050101, 0x03050305, 0x0305030b,
+    0x0305030f, 0x03050501, 0x03050509, 0x03050705, 0x03050901, 0x03050907, 0x03050b0b, 0x03050d01,
+    0x03050f05, 0x03070103, 0x03070109, 0x0307010f, 0x03070301, 0x03070307, 0x03070503, 0x0307050f,
+    0x03070701, 0x03070709, 0x03070903, 0x03070d05, 0x03070f01, 0x03090107, 0x0309010b, 0x03090305,
+    0x03090309, 0x03090703, 0x03090707, 0x03090905, 0x0309090d, 0x03090b01, 0x03090b09, 0x030b0103,
+    0x030b0301, 0x030b0307, 0x030b0503, 0x030b0701, 0x030b0705, 0x030b0b03, 0x030d0501, 0x030d0509,
+    0x030d050f, 0x030d0909, 0x030d090d, 0x030f0103, 0x030f0107, 0x030f0301, 0x030f0305, 0x030f0503,
+    0x030f070b, 0x030f0903, 0x030f0d05, 0x030f0f01, 0x05010101, 0x05010103, 0x05010107, 0x0501010b,
+    0x0501010f, 0x05010301, 0x05010305, 0x05010309, 0x0501030d, 0x05010503, 0x05010507, 0x0501050f,
+    0x05010701, 0x05010705, 0x05010903, 0x05010907, 0x0501090b, 0x05010b01, 0x05010b05, 0x05010d0f,
+    0x05010f01, 0x05010f07, 0x05010f0b, 0x05030101, 0x05030105, 0x05030301, 0x05030307, 0x0503030f,
+    0x05030505, 0x0503050b, 0x05030703, 0x05030709, 0x05030905, 0x05030b03, 0x05050103, 0x05050109,
+    0x0505010f, 0x05050503, 0x05050507, 0x05050701, 0x0505070f, 0x05050903, 0x05050b07, 0x05050b0f,
+    0x05050f03, 0x05050f09, 0x05070101, 0x05070105, 0x0507010b, 0x05070303, 0x05070505, 0x05070509,
+    0x05070703, 0x05070707, 0x05070905, 0x05070b01, 0x05070d0d, 0x05090103, 0x0509010f, 0x05090501,
+    0x05090507, 0x05090705, 0x0509070b, 0x05090903, 0x05090f05, 0x05090f0b, 0x050b0109, 0x050b0303,
+    0x050b0505, 0x050b070f, 0x050b0901, 0x050b0b07, 0x050b0f01, 0x050d0101, 0x050d0105, 0x050d010f,
+    0x050d0503, 0x050d0b0b, 0x050d0d03, 0x050f010b, 0x050f0303, 0x050f050d, 0x050f0701, 0x050f0907,
+    0x050f0b01, 0x07010105, 0x07010303, 0x07010307, 0x0701030b, 0x0701030f, 0x07010505, 0x07010703,
+    0x07010707, 0x0701070b, 0x07010905, 0x07010909, 0x0701090f, 0x07010b03, 0x07010d07, 0x07010f03,
+    0x07030103, 0x07030107, 0x0703010b, 0x07030309, 0x07030503, 0x07030507, 0x07030901, 0x07030d01,
+    0x07030f05, 0x07030f0d, 0x07050101, 0x07050305, 0x07050501, 0x07050705, 0x07050709, 0x07050b01,
+    0x07070103, 0x07070301, 0x07070309, 0x07070503, 0x07070507, 0x0707050f, 0x07070701, 0x07070903,
+    0x07070907, 0x0707090f, 0x07070b0b, 0x07070f07, 0x07090107, 0x07090303, 0x0709030d, 0x07090505,
+    0x07090703, 0x07090b05, 0x07090d01, 0x07090d09, 0x070b0103, 0x070b0301, 0x070b0305, 0x070b050b,
+    0x070b0705, 0x070b0909, 0x070b0b0d, 0x070b0f07, 0x070d030d, 0x070d0903, 0x070f0103, 0x070f0107,
+    0x070f0501, 0x070f0505, 0x070f070b, 0x09010101, 0x09010109, 0x09010305, 0x09010501, 0x09010509,
+    0x0901050f, 0x09010705, 0x09010903, 0x09010b01, 0x09010f01, 0x09030105, 0x0903010f, 0x09030303,
+    0x09030307, 0x09030505, 0x09030701, 0x0903070b, 0x09030907, 0x09030b03, 0x09030b0b, 0x09050103,
+    0x09050107, 0x09050301, 0x0905030b, 0x09050503, 0x09050707, 0x09050901, 0x09050b0f, 0x09050d05,
+    0x09050f01, 0x09070109, 0x09070303, 0x09070307, 0x09070501, 0x09070505, 0x09070703, 0x0907070b,
+    0x09090101, 0x09090105, 0x09090509, 0x0909070f, 0x09090901, 0x09090f03, 0x090b010b, 0x090b010f,
+    0x090b0503, 0x090b0d05, 0x090d0307, 0x090d0709, 0x090d0d01, 0x090f0301, 0x090f030b, 0x090f0701,
+    0x090f0907, 0x090f0b03, 0x0b010105, 0x0b010301, 0x0b010309, 0x0b010505, 0x0b010901, 0x0b010909,
+    0x0b01090f, 0x0b010b05, 0x0b010d0d, 0x0b010f09, 0x0b030103, 0x0b030107, 0x0b03010b, 0x0b030305,
+    0x0b030503, 0x0b030705, 0x0b030f05, 0x0b050101, 0x0b050303, 0x0b050507, 0x0b050701, 0x0b05070d,
+    0x0b050b07, 0x0b070105, 0x0b07010f, 0x0b070301, 0x0b07050f, 0x0b070909, 0x0b070b03, 0x0b070d0b,
+    0x0b070f07, 0x0b090103, 0x0b090109, 0x0b090501, 0x0b090705, 0x0b09090d, 0x0b0b0305, 0x0b0b050d,
+    0x0b0b0b03, 0x0b0b0b07, 0x0b0d0905, 0x0b0f0105, 0x0b0f0109, 0x0b0f0505, 0x0d010303, 0x0d010307,
+    0x0d01030b, 0x0d010703, 0x0d010707, 0x0d010d01, 0x0d030101, 0x0d030501, 0x0d03050f, 0x0d030d09,
+    0x0d050305, 0x0d050709, 0x0d050905, 0x0d050b0b, 0x0d050d05, 0x0d050f01, 0x0d070101, 0x0d070309,
+    0x0d070503, 0x0d070901, 0x0d09050b, 0x0d090907, 0x0d090d05, 0x0d0b0101, 0x0d0b0107, 0x0d0b0709,
+    0x0d0b0d01, 0x0d0d010b, 0x0d0d0901, 0x0d0f0303, 0x0d0f0307, 0x0f010101, 0x0f010109, 0x0f01010f,
+    0x0f010501, 0x0f010505, 0x0f01070d, 0x0f010901, 0x0f010b09, 0x0f010d05, 0x0f030105, 0x0f030303,
+    0x0f030509, 0x0f030907, 0x0f03090b, 0x0f050103, 0x0f050109, 0x0f050301, 0x0f05030d, 0x0f050503,
+    0x0f050701, 0x0f050b03, 0x0f070105, 0x0f070705, 0x0f07070b, 0x0f070b07, 0x0f090103, 0x0f09010b,
+    0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101,
+};
+
+__dpct_inline__ uint32_t night_spread4(uint32_t b4) { return ((b4 * 0x00204081u) & 0x01010101u) * 0xFFu; }
+__dpct_inline__ uint32_t night_spread4s(uint32_t b4) {   // the same without 32-bit multiplies (mul+macl on Xe2)
+    const uint32_t t = (b4 | (b4 << 7) | (b4 << 14) | (b4 << 21)) & 0x01010101u;
+    return (t << 8) - t;
+}
+
+struct NightIQ3S0 {
+    using Block = NightIQ3SBlock;
+    static constexpr int kTableWords = 512;
+    static uint32_t table_entry(int i) { return kNightIq3sGrid[i]; }
+    struct A { sycl::int4 u0, u1; float ds; };
+    struct W { int g[8]; int ls; float dw; };
+    static A act(const Q81Block* xb, int g) {
+        A a; a.u0 = ld_q8_16(xb + g, 0); a.u1 = ld_q8_16(xb + g, 1); a.ds = (float) xb[g].ds[0]; return a;
+    }
+    static W load(const Block* b, int g, const uint32_t* tl) {
+        const uint16_t* q16 = reinterpret_cast<const uint16_t*>(b->qs) + 4 * g;      // qs bytes 8g .. 8g+7
+        const uint32_t qa = uint32_t(q16[0]) | (uint32_t(q16[1]) << 16), qb = uint32_t(q16[2]) | (uint32_t(q16[3]) << 16);
+        const uint32_t qh = b->qh[g];
+        const uint16_t* s16 = reinterpret_cast<const uint16_t*>(b->signs) + 2 * g;  // sign bytes 4g .. 4g+3
+        const uint32_t sg = uint32_t(s16[0]) | (uint32_t(s16[1]) << 16);
+        W r;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const uint32_t qw = l0 < 4 ? qa : qb;
+            const uint32_t i0 = ((qw >> (8 * (l0 & 3))) & 0xFF) | ((qh << (8 - l0)) & 0x100);
+            const uint32_t i1 = ((qw >> (8 * ((l0 + 1) & 3))) & 0xFF) | ((qh << (7 - l0)) & 0x100);
+            const uint32_t sp = (sg >> (4 * l0)) & 0xFF;
+            const uint32_t m0 = night_spread4(sp & 0x0F), m1 = night_spread4(sp >> 4);
+            r.g[l0 + 0] = (int) ((tl[i0] ^ m0) + (m0 & 0x01010101u));
+            r.g[l0 + 1] = (int) ((tl[i1] ^ m1) + (m1 & 0x01010101u));
+        }
+        r.ls = 1 + 2 * ((b->scales[g >> 1] >> (4 * (g & 1))) & 0x0F);
+        r.dw = (float) b->d;
+        return r;
+    }
+    static float dot(const W& r, const A& a) {
+        int sumi = 0;
+        sumi = strata::dp4a(r.g[0], a.u0.x(), sumi); sumi = strata::dp4a(r.g[1], a.u0.y(), sumi);
+        sumi = strata::dp4a(r.g[2], a.u0.z(), sumi); sumi = strata::dp4a(r.g[3], a.u0.w(), sumi);
+        sumi = strata::dp4a(r.g[4], a.u1.x(), sumi); sumi = strata::dp4a(r.g[5], a.u1.y(), sumi);
+        sumi = strata::dp4a(r.g[6], a.u1.z(), sumi); sumi = strata::dp4a(r.g[7], a.u1.w(), sumi);
+        sumi *= r.ls;
+        const float d = r.dw * a.ds;
+        return d * sumi;
+    }
+};
+
+template <bool GLOBAL_GRID, bool SHIFT_SPREAD = false>
+struct NightIQ3Sx : NightIQ3S0 {
+    static constexpr int kTableWords = GLOBAL_GRID ? 0 : 512;
+    static W load(const Block* b, int g, const uint32_t* tl) {
+        const uint32_t* T = GLOBAL_GRID ? kNightIq3sGrid : tl;
+        const uint16_t* q16 = reinterpret_cast<const uint16_t*>(b->qs) + 4 * g;
+        const uint32_t qa = uint32_t(q16[0]) | (uint32_t(q16[1]) << 16), qb = uint32_t(q16[2]) | (uint32_t(q16[3]) << 16);
+        const uint32_t qh = b->qh[g];
+        const uint16_t* s16 = reinterpret_cast<const uint16_t*>(b->signs) + 2 * g;
+        const uint32_t sg = uint32_t(s16[0]) | (uint32_t(s16[1]) << 16);
+        W r;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const uint32_t qw = l0 < 4 ? qa : qb;
+            const uint32_t i0 = ((qw >> (8 * (l0 & 3))) & 0xFF) | ((qh << (8 - l0)) & 0x100);
+            const uint32_t i1 = ((qw >> (8 * ((l0 + 1) & 3))) & 0xFF) | ((qh << (7 - l0)) & 0x100);
+            const uint32_t sp = (sg >> (4 * l0)) & 0xFF;
+            const uint32_t m0 = SHIFT_SPREAD ? night_spread4s(sp & 0x0F) : night_spread4(sp & 0x0F);
+            const uint32_t m1 = SHIFT_SPREAD ? night_spread4s(sp >> 4) : night_spread4(sp >> 4);
+            r.g[l0 + 0] = (int) ((T[i0] ^ m0) + (m0 & 0x01010101u));
+            r.g[l0 + 1] = (int) ((T[i1] ^ m1) + (m1 & 0x01010101u));
+        }
+        r.ls = 1 + 2 * ((b->scales[g >> 1] >> (4 * (g & 1))) & 0x0F);
+        r.dw = (float) b->d;
+        return r;
+    }
+    static float dot(const W& r, const A& a) {
+        int s0 = 0, s1 = 0;   // two chains; integer addition is exact, so sumi is the same value as one chain
+        s0 = strata::dp4a(r.g[0], a.u0.x(), s0); s1 = strata::dp4a(r.g[4], a.u1.x(), s1);
+        s0 = strata::dp4a(r.g[1], a.u0.y(), s0); s1 = strata::dp4a(r.g[5], a.u1.y(), s1);
+        s0 = strata::dp4a(r.g[2], a.u0.z(), s0); s1 = strata::dp4a(r.g[6], a.u1.z(), s1);
+        s0 = strata::dp4a(r.g[3], a.u0.w(), s0); s1 = strata::dp4a(r.g[7], a.u1.w(), s1);
+        int sumi = s0 + s1;
+        sumi *= r.ls;
+        const float d = r.dw * a.ds;
+        return d * sumi;
+    }
+};
+struct NightIQ4NL1 {   // 1 lane per block (Wide32IQ4NL's lane split), lanes padded to 16
+    using Block = IQ4NLBlock;
+    static constexpr int LPB = 1, EB = 32, kTableWords = 0;
+    static uint32_t table_entry(int) { return 0; }
+    struct A { sycl::int4 u0, u1; float ds; };
+    struct W { sycl::int4 lo, hi; float d; };
+    static A act(const Q81Block* xb, int) { A a; a.u0 = ld_q8_16(xb, 0); a.u1 = ld_q8_16(xb, 1); a.ds = (float) xb->ds[0]; return a; }
+    static W load(const Block* b, int, const uint32_t*) {
+        W r; const sycl::int4 q = load16_a2(b->qs);
+        r.lo = sycl::int4((int) iq4_lut4((uint32_t) q.x() & 0x0f0f0f0f), (int) iq4_lut4((uint32_t) q.y() & 0x0f0f0f0f),
+                          (int) iq4_lut4((uint32_t) q.z() & 0x0f0f0f0f), (int) iq4_lut4((uint32_t) q.w() & 0x0f0f0f0f));
+        r.hi = sycl::int4((int) iq4_lut4(((uint32_t) q.x() >> 4) & 0x0f0f0f0f), (int) iq4_lut4(((uint32_t) q.y() >> 4) & 0x0f0f0f0f),
+                          (int) iq4_lut4(((uint32_t) q.z() >> 4) & 0x0f0f0f0f), (int) iq4_lut4(((uint32_t) q.w() >> 4) & 0x0f0f0f0f));
+        r.d = (float) b->d; return r;
+    }
+    static float dot(const W& r, const A& a) { return r.d * a.ds * (float) dp4a4(r.hi, a.u1, dp4a4(r.lo, a.u0, 0)); }
+};
+
+template <typename F> constexpr int lpb_of() { if constexpr (requires { F::LPB; }) return F::LPB; else return 8; }
+template <typename F> constexpr int eb_of() { if constexpr (requires { F::EB; }) return F::EB; else return 256; }
+
+template <typename F, int NCOLS, int R>
+void night_kreg2_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
+                  int n_in, int n_out, float* __restrict__ slm) {
+    constexpr int LPB = lpb_of<F>(), EB = eb_of<F>();
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<1>();
+    const sycl::sub_group sg = it.get_sub_group();
+    constexpr int P0 = R * NCOLS, P = night_p<R, NCOLS>(), PL = P / NIGHT_SG;
+    const int lid = int(it.get_local_id(0)), lane = int(sg.get_local_linear_id()), sgi = lid / NIGHT_SG;
+    const int nsg = int(it.get_local_range(0)) / NIGHT_SG;
+    const int bpr = n_in / EB, x_stride = n_in / Q8K;
+    const bool live = lid / LPB < bpr;
+    const int kb = live ? lid / LPB : 0, q = lid % LPB;
+    const uint32_t* tbl = nullptr;
+    if constexpr (F::kTableWords > 0) {
+        uint32_t* tw = reinterpret_cast<uint32_t*>(slm + 2 * nsg * P);
+        for (int i = lid; i < F::kTableWords; i += int(it.get_local_range(0))) tw[i] = F::table_entry(i);
+        it.barrier(sycl::access::fence_space::local_space);
+        tbl = tw;
+    }
+    typename F::A a[NCOLS];
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        a[j] = F::act(x + std::size_t(j) * x_stride + kb * (EB / Q8K), q);
+        if (!live) a[j] = typename F::A{};
+    }
+    const int ntiles = (n_out + R - 1) / R;
+    int buf = 0;
+    for (int t = int(it.get_group(0)); t < ntiles; t += int(it.get_group_range(0))) {
+        const int row0 = t * R;
+        const typename F::Block* wt = w + std::size_t(row0) * bpr + kb;
+        const int rlast = n_out - 1 - row0;
+        typename F::W wv[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) wv[r] = F::load(wt + (r < rlast ? r : rlast) * bpr, q, tbl);
+        float v[P];
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) v[r * NCOLS + j] = F::dot(wv[r], a[j]);
+#pragma unroll
+        for (int k = P0; k < P; ++k) v[k] = 0.0f;
+        night_tsum<NIGHT_SG / 2, P, P>(v, sg, lane);
+        float* bb = slm + buf * nsg * P;
+#pragma unroll
+        for (int i = 0; i < PL; ++i) bb[sgi * P + lane * PL + i] = v[i];
+        it.barrier(sycl::access::fence_space::local_space);
+        for (int k = lid; k < P0; k += int(it.get_local_range(0))) {
+            float s = 0.0f;
+            for (int qq = 0; qq < nsg; ++qq) s += bb[qq * P + k];
+            const int r = k / NCOLS, j = k % NCOLS;
+            if (row0 + r < n_out) y[std::size_t(j) * n_out + row0 + r] = s;
+        }
+        buf ^= 1;
+    }
+}
+using NightIQ3S = NightIQ3Sx<false, true>;
+template <typename F, int NCOLS, int R, int GRF>
+void launch_night_kreg2(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, dpct::queue_ptr s) {
+    const auto* w = static_cast<const typename F::Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const int L = ((n_in / eb_of<F>()) * lpb_of<F>() + NIGHT_SG - 1) / NIGHT_SG * NIGHT_SG;
+    const int nsg = L / NIGHT_SG;
+    constexpr int P = night_p<R, NCOLS>();
+    const int tiles = (n_out + R - 1) / R;
+    s->submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> slm(sycl::range<1>(2 * nsg * P + F::kTableWords), h);
+        auto k = [=](sycl::nd_item<1>) [[sycl::reqd_sub_group_size(16)]] {
+            night_kreg2_kernel<F, NCOLS, R>(w, x, y, n_in, n_out, slm.get_multi_ptr<sycl::access::decorated::no>().get());
+        };
+        const sycl::nd_range<1> nr(std::size_t(tiles) * L, L);
+        if constexpr (GRF == 256)
+            h.parallel_for<dpct_kernel_name<class night_mmvq_kreg2_g, F, dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<R>>>(
+                nr, sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>}, k);
+        else
+            h.parallel_for<dpct_kernel_name<class night_mmvq_kreg2, F, dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<R>>>(nr, k);
+    });
+}
+// IQ3_S tiles (probe2 iq3s_r3.txt): R=2 for n_out <= 1024, else nc1-2 R4, nc3-4 R8 GRF256, nc5-6 R4, nc7-8 R8 GRF256
+template <int NCOLS>
+void night_iq3s_dispatch(const void* w, const void* x, float* y, int n_in, int n_out, dpct::queue_ptr s) {
+    using F = NightIQ3S;
+    if (n_out <= 1024) { launch_night_kreg2<F, NCOLS, 2, 128>(w, x, y, n_in, n_out, s); return; }
+    if constexpr (NCOLS <= 2 || NCOLS == 5 || NCOLS == 6) launch_night_kreg2<F, NCOLS, 4, 128>(w, x, y, n_in, n_out, s);
+    else launch_night_kreg2<F, NCOLS, 8, 256>(w, x, y, n_in, n_out, s);
+}
+bool try_night_iq3s(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* stream) {
+    if (!night_mmvq2_on() || !w || !x || !y || !stream || ncols < 1 || ncols > 8 || n_out <= 0 || n_in <= 0 ||
+        n_in % QK != 0 || n_in > 32768 || (reinterpret_cast<uintptr_t>(w) & 1u) || (reinterpret_cast<uintptr_t>(x) & 3u)) return false;
     const auto s = strata::q_of(stream);
     switch (ncols) {
-        case 1: night_dispatch<F, 1>(weights, x_q8_1, y, n_in, n_out, s); return true;
-        case 2: night_dispatch<F, 2>(weights, x_q8_1, y, n_in, n_out, s); return true;
-        case 3: night_dispatch<F, 3>(weights, x_q8_1, y, n_in, n_out, s); return true;
-        case 4: night_dispatch<F, 4>(weights, x_q8_1, y, n_in, n_out, s); return true;
-        case 5: night_dispatch<F, 5>(weights, x_q8_1, y, n_in, n_out, s); return true;
-        case 6: night_dispatch<F, 6>(weights, x_q8_1, y, n_in, n_out, s); return true;
-        case 7: night_dispatch<F, 7>(weights, x_q8_1, y, n_in, n_out, s); return true;
-        default: night_dispatch<F, 8>(weights, x_q8_1, y, n_in, n_out, s); return true;
+        case 1: night_iq3s_dispatch<1>(w, x, y, n_in, n_out, s); return true;
+        case 2: night_iq3s_dispatch<2>(w, x, y, n_in, n_out, s); return true;
+        case 3: night_iq3s_dispatch<3>(w, x, y, n_in, n_out, s); return true;
+        case 4: night_iq3s_dispatch<4>(w, x, y, n_in, n_out, s); return true;
+        case 5: night_iq3s_dispatch<5>(w, x, y, n_in, n_out, s); return true;
+        case 6: night_iq3s_dispatch<6>(w, x, y, n_in, n_out, s); return true;
+        case 7: night_iq3s_dispatch<7>(w, x, y, n_in, n_out, s); return true;
+        default: night_iq3s_dispatch<8>(w, x, y, n_in, n_out, s); return true;
+    }
+}
+// IQ4_NL: only the measured class (n_in <= 1024, the 640-wide shared-expert down); R=4 GRF128 at every width
+bool try_night_iq4nl(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* stream) {
+    if (!night_mmvq2_on() || !w || !x || !y || !stream || ncols < 1 || ncols > 8 || n_out <= 0 || n_in <= 0 ||
+        n_in % 32 != 0 || n_in > 1024 || (reinterpret_cast<uintptr_t>(w) & 1u) || (reinterpret_cast<uintptr_t>(x) & 3u)) return false;
+    const auto s = strata::q_of(stream);
+    using F = NightIQ4NL1;
+    switch (ncols) {
+        case 1: launch_night_kreg2<F, 1, 4, 128>(w, x, y, n_in, n_out, s); return true;
+        case 2: launch_night_kreg2<F, 2, 4, 128>(w, x, y, n_in, n_out, s); return true;
+        case 3: launch_night_kreg2<F, 3, 4, 128>(w, x, y, n_in, n_out, s); return true;
+        case 4: launch_night_kreg2<F, 4, 4, 128>(w, x, y, n_in, n_out, s); return true;
+        case 5: launch_night_kreg2<F, 5, 4, 128>(w, x, y, n_in, n_out, s); return true;
+        case 6: launch_night_kreg2<F, 6, 4, 128>(w, x, y, n_in, n_out, s); return true;
+        case 7: launch_night_kreg2<F, 7, 4, 128>(w, x, y, n_in, n_out, s); return true;
+        default: launch_night_kreg2<F, 8, 4, 128>(w, x, y, n_in, n_out, s); return true;
     }
 }
 
@@ -3681,13 +4240,13 @@ void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_
 
 void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream) {
+    if (try_night<NightQ5K>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }   // STRATA_NIGHT_MMVQ=1 (before validate_shape: ncols 9-16 at level 2)
     validate_shape(n_in, ncols, QK);
     if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
     validate_pointer(weights);
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
-    if (try_night<NightQ5K>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }   // STRATA_NIGHT_MMVQ=1
     if (try_wide<WideQ5K>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
     STRATA_WAVE_MMVQ(Q5KTraits)
     if (ncols > 1) {
@@ -3905,13 +4464,13 @@ void native_q3_k_f32(const void* weights, const float* x, void* scratch_q8_1,
 
 void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
+    if (try_night<NightIQ4XS>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }   // STRATA_NIGHT_MMVQ=1 (before validate_shape: ncols 9-16 at level 2)
     validate_shape(n_in, ncols, 256);
     if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
     validate_pointer(weights);
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
-    if (try_night<NightIQ4XS>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }   // STRATA_NIGHT_MMVQ=1
     if (try_wide<WideIQ4XS>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
     STRATA_WAVE_MMVQ(IQ4XSTraits)
     if (ncols > 1) {
@@ -3997,13 +4556,13 @@ void native_iq4_xs_f32(const void* weights, const float* x, void* scratch_q8_1,
 
 void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream) {
+    if (try_night<NightQ4K>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }   // STRATA_NIGHT_MMVQ=1 (before validate_shape: ncols 9-16 at level 2)
     validate_shape(n_in, ncols, 256);
     if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
     validate_pointer(weights);
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
-    if (try_night<NightQ4K>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }   // STRATA_NIGHT_MMVQ=1
     if (try_wide<WideQ4K>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
     STRATA_WAVE_MMVQ(Q4KTraits)
     if (ncols > 1) {
@@ -4289,6 +4848,7 @@ void native_q8_0_f32(const void* weights, const float* x, void* scratch_q8_1,
 
 void native_iq4_nl_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
+    if (try_night_iq4nl(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }   // STRATA_NIGHT_MMVQ2=1
     if (try_wide32<Wide32IQ4NL>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
     small_mmvq<IQ4NLBlock, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
 }
@@ -4406,6 +4966,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     case 23: native_iq4_xs_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 42: native_q2_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 16: case 17: case 18: case 21: case 22: case 29:
+        if (ggml_type == 21 && try_night_iq3s(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); break; }   // STRATA_NIGHT_MMVQ2=1
         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
     }
