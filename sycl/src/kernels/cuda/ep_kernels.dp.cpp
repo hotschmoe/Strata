@@ -1,6 +1,7 @@
 // src/kernels/cuda/ep_kernels.dp.cpp (SYCL port only) - see include/strata/kernels/ep_kernels.hpp.
 #include <sycl/sycl.hpp>
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include "strata/sycl_queue.hpp"
 #include "strata/sycl_doorbell.hpp"
@@ -80,6 +81,130 @@ void ep_prefill_finish(const float* rows, const int32_t* slot, const float* weig
             auto* dst = reinterpret_cast<sycl::float4*>(out);
             dst[i] = acc + dst[i] + sh * g;
         });
+}
+
+// Night lab: FP16 + per-token power-of-two scale return of the peer sums (see ep_kernels.hpp).
+template<bool Push> class ep_prefill_reduce_h_kernel;
+template<bool Push>
+static void reduce_h_impl(const float* rows, const int32_t* slot, const float* weights, uint16_t* sum_h, float* scale,
+                          int64_t tokens, int64_t local_rows, int64_t width, int k, void* stream) {
+    constexpr int WG = 160, V = 4;                       // 160 x 4 float4 = 2560 values per token row
+    const int64_t vec_row = width / 4;
+    // STRATA_NIGHT_PREFILL_F16SUM_GROUPS: the work-groups of the push (default 64, as ep_prefill_reduce's push)
+    static const int64_t push_groups = [] {
+        const char* v = std::getenv("STRATA_NIGHT_PREFILL_F16SUM_GROUPS");
+        return v ? std::max<int64_t>(1, std::atoll(v)) : (int64_t) 64;
+    }();
+    const size_t groups = Push ? (size_t) std::min<int64_t>(tokens, push_groups) : (size_t) std::min<int64_t>(tokens, 1024);
+    q_of(stream)->parallel_for<ep_prefill_reduce_h_kernel<Push>>(
+        sycl::nd_range<1>(groups * WG, WG), [=](sycl::nd_item<1> it) {
+            const int lid = (int) it.get_local_id(0);
+            for (int64_t t = it.get_group(0); t < tokens; t += (int64_t) groups) {
+                sycl::float4 acc[V];
+                float mx = 0.0f;
+                for (int v = 0; v < V; ++v) {
+                    const int64_t d = ((int64_t) lid + (int64_t) v * WG) * 4;
+                    sycl::float4 a(0.0f);
+                    if (d < width) {
+                        for (int j = 0; j < k; ++j) {
+                            const int64_t row = slot[t * k + j] - local_rows;
+                            if (row >= 0) {
+                                const auto value = *reinterpret_cast<const sycl::float4*>(rows + row * width + d);
+                                a = sycl::fma(sycl::float4(weights[t * k + j]), value, a);
+                            }
+                        }
+                    }
+                    acc[v] = a;
+                    mx = sycl::fmax(mx, sycl::fmax(sycl::fmax(sycl::fabs(a.x()), sycl::fabs(a.y())),
+                                                   sycl::fmax(sycl::fabs(a.z()), sycl::fabs(a.w()))));
+                }
+                mx = sycl::reduce_over_group(it.get_group(), mx, sycl::maximum<float>());
+                int e = 0;
+                if (mx > 0.0f && sycl::isfinite(mx)) e = sycl::ilogb(mx) - 14;   // max * 2^-e in [2^14, 2^15)
+                const float inv = sycl::ldexp(1.0f, -e);
+                for (int v = 0; v < V; ++v) {
+                    const int64_t d = ((int64_t) lid + (int64_t) v * WG) * 4;
+                    if (d >= width) continue;
+                    const sycl::float4 a = acc[v] * inv;
+                    sycl::vec<sycl::half, 4> h(sycl::half(a.x()), sycl::half(a.y()), sycl::half(a.z()), sycl::half(a.w()));
+                    *reinterpret_cast<sycl::vec<sycl::half, 4>*>(sum_h + t * width + d) = h;
+                }
+                if (lid == 0) scale[t] = sycl::ldexp(1.0f, e);
+                (void) vec_row;
+            }
+            if constexpr (Push) sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+        });
+}
+void ep_prefill_reduce_h(const float* rows, const int32_t* slot, const float* weights, uint16_t* sum_h, float* scale,
+                         int64_t tokens, int64_t local_rows, int64_t width, int k, void* stream, bool push) {
+    if (tokens <= 0) return;
+    if (push) reduce_h_impl<true>(rows, slot, weights, sum_h, scale, tokens, local_rows, width, k, stream);
+    else reduce_h_impl<false>(rows, slot, weights, sum_h, scale, tokens, local_rows, width, k, stream);
+}
+
+void ep_prefill_finish_h(const float* rows, const int32_t* slot, const float* weights, const float* shared,
+                         const float* gate, const uint16_t* sum_h, const float* scale, float* out, int64_t tokens,
+                         int64_t local_rows, int64_t width, int k, void* stream) {
+    constexpr size_t WG = 256;
+    const size_t vectors = (size_t) tokens * (size_t) width / 4;
+    q_of(stream)->parallel_for<class ep_prefill_finish_h_kernel>(
+        sycl::nd_range<1>(((vectors + WG - 1) / WG) * WG, WG), [=](sycl::nd_item<1> it) {
+            const size_t i = it.get_global_id(0);
+            if (i >= vectors) return;
+            const int64_t t = i / (width / 4), d = i % (width / 4) * 4;
+            sycl::float4 acc(0.0f);
+            for (int j = 0; j < k; ++j) {
+                const int64_t row = slot[t * k + j];
+                if (row < local_rows) {
+                    const auto value = *reinterpret_cast<const sycl::float4*>(rows + row * width + d);
+                    acc = sycl::fma(sycl::float4(weights[t * k + j]), value, acc);
+                }
+            }
+            // 4 halves = 2 words, read past the caches (the other card wrote them over PCIe)
+            const uint32_t* w = reinterpret_cast<const uint32_t*>(sum_h + t * width + d);
+            const uint32_t w0 = load_uncached(w), w1 = load_uncached(w + 1);
+            const uint32_t sw = load_uncached(reinterpret_cast<const uint32_t*>(scale + t));
+            const float sc = sycl::bit_cast<float>(sw);
+            const auto h0 = sycl::bit_cast<sycl::vec<sycl::half, 2>>(w0), h1 = sycl::bit_cast<sycl::vec<sycl::half, 2>>(w1);
+            const sycl::float4 peer(sc * (float) h0[0], sc * (float) h0[1], sc * (float) h1[0], sc * (float) h1[1]);
+            const float g = 1.0f / (1.0f + sycl::native::exp(-gate[t]));
+            const auto sh = reinterpret_cast<const sycl::float4*>(shared)[i];
+            auto* dst = reinterpret_cast<sycl::float4*>(out);
+            dst[i] = acc + peer + sh * g;
+        });
+}
+
+void ep_push_signal(void* peer_dst, const void* src, int64_t n4, uint32_t* done, uint32_t* peer_flag, uint32_t value,
+                    void* stream) {
+    if (n4 <= 0) return;
+    constexpr size_t WG = 256;
+    const size_t groups = (size_t) std::min<int64_t>((n4 + (int64_t) WG - 1) / (int64_t) WG, 4096);
+    using sys_rmw = sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::system>;
+    sycl::float4* d = (sycl::float4*) peer_dst;
+    const sycl::float4* s = (const sycl::float4*) src;
+    q_of(stream)->parallel_for<class night_ep_push_signal_kernel>(sycl::nd_range<1>(groups * WG, WG), [=](sycl::nd_item<1> it) {
+        for (int64_t i = (int64_t) it.get_global_id(0); i < n4; i += (int64_t) (groups * WG)) d[i] = s[i];
+        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+        sycl::group_barrier(it.get_group(), sycl::memory_scope::system);
+        if (it.get_local_id(0) == 0 && sys_rmw(*done).fetch_add(1u) == (uint32_t) groups - 1) {
+            *done = 0;   // every group has counted itself: the next call starts from zero
+            sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+            sys_store(peer_flag, value);
+        }
+    });
+}
+
+void ep_wait_value(const uint32_t* flag, uint32_t value, uint32_t spin_max, uint32_t* err, uint32_t code, void* stream) {
+    q_of(stream)->single_task<class night_ep_wait_value_kernel>([=] {
+        uint32_t spin = 0;
+        while ((int32_t) (sys_load(flag) - value) < 0) {
+            if (++spin >= spin_max) {
+                if (err != nullptr) sys_store(err, code);
+                break;
+            }
+        }
+        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+    });
 }
 
 void ep_bump(uint32_t* ctr, void* stream) {

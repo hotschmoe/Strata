@@ -307,6 +307,31 @@ inline bool gr_unfused() {
 
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
+// Night lab 2026-10-16 (all default off; each latched once and announced on stderr when on).
+// STRATA_NIGHT_PREFILL_EARLY=1 (expert parallel, IPC path): the host waits only for the router's ids and weights, not
+//   for the whole queue; the activation push, a doorbell to card 1 and the shared expert are queued after that point,
+//   and card 1's first kernel spins on the doorbell instead of relying on the host's full drain.  Same kernels, same
+//   inputs: bitwise the same outputs.
+// STRATA_NIGHT_PREFILL_F16SUM=1 (with STRATA_EP_PREFILL_REDUCE=1): card 1's per-token peer sums cross PCIe as FP16
+//   with a per-token power-of-two scale (half the bytes); card 0's finish reads them directly.  Changes numerics
+//   (relative error <= 2^-11 per value of the peer sum).
+inline bool night_env(const char* name, const char* what) {
+    const char* e = std::getenv(name);
+    const bool on = e && e[0] == '1';
+    if (on) std::fprintf(stderr, "strata prefill: %s=1: %s (night lab)\n", name, what);
+    return on;
+}
+inline bool night_early() {
+    static const bool v = night_env("STRATA_NIGHT_PREFILL_EARLY",
+                                    "card 1 starts on a doorbell after the activation push; the shared expert runs after the host's routing wait");
+    return v;
+}
+inline bool night_f16sum() {
+    static const bool v = night_env("STRATA_NIGHT_PREFILL_F16SUM",
+                                    "the EP peer sums return as FP16 x per-token power-of-two scale (numerics change)");
+    return v;
+}
+
 // Either cudaMalloc (owned, freed with the object) or a bump allocation from a borrowed region; with no base and
 // no region it only counts, which is how `bytes_needed` sizes the region.
 struct Alloc {
@@ -550,6 +575,14 @@ struct PeerPrefill {
     bool reduce_rows = false;
     bool reduce_push = false;
     core::EpRegion sum_reg;
+    // night lab: STRATA_NIGHT_PREFILL_EARLY's doorbell (on card 1, written by card 0) and its epoch / error flag;
+    // STRATA_NIGHT_PREFILL_F16SUM's FP16 sums in sum_reg (T*N halves, then T float scales)
+    core::EpRegion flag_reg;
+    uint32_t epoch = 0;
+    uint32_t* early_err = nullptr;
+    uint32_t* push_done = nullptr;   // on the primary: ep_push_signal's group counter (zero between calls)
+    bool early = false;
+    bool f16sum = false;
     int32_t* reduce_slot = nullptr;
     float* reduce_weight = nullptr;
     std::vector<int32_t> reduce_slot_host;
@@ -647,6 +680,8 @@ struct PeerPrefill {
         core::ep_region_free(x_reg);
         core::ep_region_free(rows_reg);
         core::ep_region_free(sum_reg);
+        core::ep_region_free(flag_reg);   // night lab EARLY
+        if (early_err) sycl::free(early_err, *s);
         for (void *p : owned)
             DPCT_CHECK_ERROR(sycl::free(p, dpct::get_in_order_queue()));
         if (ev_done) dpct::destroy_event(ev_done);
@@ -1898,6 +1933,16 @@ bool Prefill::set_ep_peer(int device, core::ExpertCache* cache, std::string& err
     if (ok && pp->reduce_rows)
         ok = core::ep_region_alloc(pp->reduce_push ? primary : device, pp->reduce_push ? device : primary,
                                    (size_t) m.T_max * N * 4, pp->sum_reg, err);
+    if (ok && night_early() && (m.T_max * N) % 8 == 0) {
+        ok = core::ep_region_alloc(device, primary, 4096, pp->flag_reg, err);
+        if (ok) {   // the primary's group counter: a small allocation of its own, zeroed
+            pp->push_done = sycl::malloc_device<uint32_t>(16, dpct::get_in_order_queue());
+            ok = pp->push_done != nullptr;
+            if (ok) dpct::get_in_order_queue().memset(pp->push_done, 0, 64).wait();
+        }
+        pp->early = ok;
+    }
+    if (ok && pp->reduce_rows && night_f16sum()) pp->f16sum = true;
     if (!ok) return false;
     const core::OnDevice on(device);
     ok = DPCT_CHECK_ERROR(pp->s = dpct::get_current_device().create_queue(true)) == 0 &&
@@ -1927,6 +1972,11 @@ bool Prefill::set_ep_peer(int device, core::ExpertCache* cache, std::string& err
         pp->reduce_weight_host.resize((size_t) pp->cap_rows);
         std::fprintf(stderr, "strata prefill: EP row reduction enabled: one FP32 row per token returns; "
                              "FP32 addition order changes (STRATA_EP_PREFILL_REDUCE=1)\n");
+    }
+    if (ok && pp->early) {
+        pp->early_err = sycl::malloc_host<uint32_t>(1, *pp->s);
+        ok = pp->early_err != nullptr;
+        if (ok) *pp->early_err = 0;
     }
     if (ok) {
         pp->gemm = std::make_unique<Gemm>();
@@ -3365,13 +3415,20 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
                     // the shared expert and its scalar gate
-                    if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
-                    swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
-                    if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
-                    if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
-                    m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
-                    if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
+                    auto shared_expert = [&]() -> bool {
+                        if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
+                        if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
+                        swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
+                        if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
+                        if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
+                        m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
+                        if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
+                        return true;
+                    };
+                    // night lab EARLY: the expert-parallel IPC layer queues the shared expert after the host's routing
+                    // wait point instead (below); every other layer keeps it here
+                    const bool night_early_l = m.pp && m.pp->ipc() && m.pp->early;
+                    if (!night_early_l && !shared_expert()) return false;
                     // #136: STRATA_PF_FUSED=1 - the Q2_0 pack's experts on the fused int8 kernels (moe_fused.hpp),
                     // grouped on the GPU: no host sync.  Only where every expert's place is known before the routing -
                     // the streamed walk, in which every non-resident expert of the layer comes through the ring in id
@@ -3389,6 +3446,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     const bool fused_only = mmq_plan().any && mmq_plan().fo[(size_t) l];
                     const bool fused_nat = (use_mmq || fused_only) && stream_all && no_peer && lay.native && fused::native_supported(mmq_gt, mmq_dt);
                     const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
+                    if (night_early_l && fused_l && !shared_expert()) return false;   // (EP never takes fused_l)
                     // #583 / #954: the fused layout's GU/H/Xq hold the grouping tables and the int8 rows, sized for
                     // stream_all_min() - 1 tokens of MMQ's rows, so a layer that takes MMQ or the FP16 path at the FULL
                     // chunk would write T*K rows into a (stream_all_min() - 1)*K-row buffer: an illegal access, or a kernel
@@ -3483,6 +3541,20 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         */
                         else m.cs->memcpy(m.ids_host.data(), m.ids,
                                           (size_t)T * K * 4);
+                        if (night_early_l) {
+                            // night lab EARLY: the host needs only the ids and weights; the push, the doorbell that
+                            // tells card 1 the rows are there, and the shared expert run while the host routes
+                            if (m.pp->reduce_rows)
+                                m.cs->memcpy(m.pp->reduce_weight_host.data(), m.w, (size_t) T * K * 4);
+                            sycl::event routed = m.cs->ext_oneapi_submit_barrier();
+                            // the copy_f32_wide bytes (FP16 bits); every group fences, the last raises the doorbell
+                            strata::kernels::ep_push_signal(m.pp->x_reg.remote, m.mixed_h, T * N / 8, m.pp->push_done,
+                                                            (uint32_t*) m.pp->flag_reg.remote, ++m.pp->epoch, m.cs);
+                            if (!shared_expert()) return false;
+                            core::progress_at("reading the prompt (batched): waiting for the GPU (attention, router) at layer",
+                                              l, p0);
+                            routed.wait();
+                        } else {
                         // before the wait below, which covers it; a kernel, as the region is not USM of this context
                         if (m.pp && m.pp->ipc()) copy_f32_wide((float*) m.pp->x_reg.remote, (const float*) m.mixed_h, T * N / 2, m.cs);   // FP16 bits
                         if (m.pp && m.pp->reduce_rows)
@@ -3492,6 +3564,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         core::progress_at("reading the prompt (batched): waiting for the GPU (attention, router) at layer",
                                           l, p0);
                         m.cs->wait();
+                        }
                         core::progress_at("reading the prompt (batched): layer", l, p0);
                         pt.fold();
                         if (pe.on) {   // the peer's marks so far are done: the primary waited for its last rows
@@ -3673,6 +3746,9 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             behavior.
                             */
                             // ipc: inbound PCIe writes do not invalidate this card's caches
+                            if (P.ipc() && P.early)   // night lab EARLY: card 0's push of this layer has landed
+                                strata::kernels::ep_wait_value((const uint32_t*) P.flag_reg.local, P.epoch, 50000000u,
+                                                               P.early_err, 1u, ps);
                             if (P.ipc()) strata::kernels::ep_copy_uncached(P.mixed_h, P.x_reg.local, (size_t) T * N * 2, ps);
                             else if (P.p2p) dpct::async_dpct_memcpy(
                                 P.mixed, P.dev, m.mixed, prevd,
@@ -3761,7 +3837,12 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                     P.gemm->f16(P.Hh, P.dq_d, rows + o * N, ne, N, 640);
                                 }
                                 strata::core::prefill_host::mark("peer_loop_end");
-                                if (P.reduce_rows)
+                                if (P.reduce_rows && P.f16sum) {   // night lab F16SUM: FP16 rows, then T scales
+                                    uint8_t* sb = (uint8_t*) (P.reduce_push ? P.sum_reg.remote : P.sum_reg.local);
+                                    strata::kernels::ep_prefill_reduce_h(rows, P.reduce_slot, P.reduce_weight,
+                                        (uint16_t*) sb, (float*) (sb + (size_t) T * N * 2),
+                                        T, rows_local, N, (int) K, ps, P.reduce_push);
+                                } else if (P.reduce_rows)
                                     strata::kernels::ep_prefill_reduce(rows, P.reduce_slot, P.reduce_weight,
                                         (float*) (P.reduce_push ? P.sum_reg.remote : P.sum_reg.local),
                                         T, rows_local, N, (int) K, ps, P.reduce_push);
@@ -4473,7 +4554,14 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             const core::OnDevice d(m.pp->dev);
                             m.pp->s->wait();
                         }
-                        if (m.pp->reduce_rows)
+                        if (m.pp->early && *m.pp->early_err != 0) {
+                            err = "prefill (STRATA_NIGHT_PREFILL_EARLY): card 1 gave up waiting for card 0's activation push at layer " +
+                                  std::to_string(l);
+                            return false;
+                        }
+                        if (m.pp->reduce_rows && m.pp->f16sum) {
+                            // night lab F16SUM: ep_prefill_finish_h below reads the FP16 sums itself
+                        } else if (m.pp->reduce_rows)
                             strata::kernels::ep_copy_uncached(m.bo, m.pp->reduce_push ? m.pp->sum_reg.local : m.pp->sum_reg.remote,
                                                              (size_t) T * N * 4, m.cs);
                         else
@@ -4484,7 +4572,12 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         if (!m.pp->p2p)
                             copy_f32_wide(m.Dm + (size_t) m.pp->back_at * N, m.pp->host_rows, m.pp->back_rows * N, m.cs);
                     }
-                    if (peer_now && m.pp->reduce_rows)
+                    if (peer_now && m.pp->ipc() && m.pp->reduce_rows && m.pp->f16sum) {
+                        const uint8_t* sb = (const uint8_t*) (m.pp->reduce_push ? m.pp->sum_reg.local : m.pp->sum_reg.remote);
+                        strata::kernels::ep_prefill_finish_h(m.Dm, m.slot_dev, m.w, m.shared, m.sg, (const uint16_t*) sb,
+                                                             (const float*) (sb + (size_t) T * N * 2), m.bo,
+                                                             T, m.pp->back_at, N, (int) K, m.cs);
+                    } else if (peer_now && m.pp->reduce_rows)
                         strata::kernels::ep_prefill_finish(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo,
                                                          T, m.pp->back_at, N, (int) K, m.cs);
                     else

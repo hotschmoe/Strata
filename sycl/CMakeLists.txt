@@ -397,6 +397,10 @@ if(STRATA_SYCL_PARITY)
   target_link_libraries(xmx_gemm_bench PRIVATE strata_kernels strata_prefill)   # -qmkl for the oneMKL reference
   add_executable(xmx_group_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/xmx_group_parity.cpp)   # A770: fused grouped XMX
   target_link_libraries(xmx_group_parity PRIVATE strata_kernels strata_prefill)
+  add_executable(night_ep_expert_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/night_ep_expert_bench.cpp)   # night lab: EP peer expert loop
+  target_link_libraries(night_ep_expert_bench PRIVATE strata_kernels strata_prefill)
+  add_executable(night_ep_sum_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/night_ep_sum_bench.cpp)   # night lab: F16 EP sums + doorbell
+  target_link_libraries(night_ep_sum_bench PRIVATE strata_kernels)
   # one native expert three ways on real GGUF rows (ggml reference, CPU path, GPU native_expert_grouped):
   #   native_expert_parity <shard1.gguf> [layer ...]
   if(STRATA_NATIVE_EXPERTS)

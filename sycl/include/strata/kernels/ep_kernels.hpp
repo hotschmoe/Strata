@@ -60,6 +60,29 @@ void ep_prefill_finish(const float* rows, const int32_t* slot, const float* weig
                        const float* shared, const float* gate, float* out,
                        int64_t tokens, int64_t local_rows, int64_t width, int k, void* stream);
 
+/// Night lab (STRATA_NIGHT_PREFILL_F16SUM=1): ep_prefill_reduce with the per-token sum sent as FP16 times a per-token
+/// power-of-two scale (half the PCIe bytes).  The FP32 sums are those of ep_prefill_reduce (same FMA order); each row is
+/// scaled by 2^-e so its largest magnitude lands in [2^14, 2^15), rounded to FP16 (relative error <= 2^-11 for every
+/// value above max * 2^-28), and 2^e is written to scale[t].  sum_h holds tokens * width halves, `width` / 4 a multiple
+/// of 160 work-items x 4 vectors (width 2560).
+void ep_prefill_reduce_h(const float* rows, const int32_t* slot, const float* weights, uint16_t* sum_h, float* scale,
+                         int64_t tokens, int64_t local_rows, int64_t width, int k, void* stream, bool push);
+/// ep_prefill_finish reading the peer sum straight from ep_prefill_reduce_h's FP16 rows (past this card's caches, as
+/// ep_copy_uncached): out = (primary sum + peer) + shared * sigmoid(gate), the order of ep_prefill_finish.
+void ep_prefill_finish_h(const float* rows, const int32_t* slot, const float* weights, const float* shared,
+                         const float* gate, const uint16_t* sum_h, const float* scale, float* out, int64_t tokens,
+                         int64_t local_rows, int64_t width, int k, void* stream);
+
+/// Night lab (STRATA_NIGHT_PREFILL_EARLY): copy n4 float4s (16-byte loads and stores, the grid of copy_f32_wide) into
+/// the other card's memory, then raise *peer_flag to `value` once EVERY work-group has fenced its stores at system scope
+/// (the last group to count itself in `done` - this card's memory, zero between calls - resets it and stores the flag),
+/// as ep_send_rows: a flag raised by a separate later kernel was seen before all rows had arrived.
+void ep_push_signal(void* peer_dst, const void* src, int64_t n4, uint32_t* done, uint32_t* peer_flag, uint32_t value,
+                    void* stream);
+/// Night lab: spin until *flag (this card's memory) - value >= 0 as int32 (epochs only grow), then fence (acquire); at
+/// spin_max loads *err (mapped host memory) = code and the wait gives up.
+void ep_wait_value(const uint32_t* flag, uint32_t value, uint32_t spin_max, uint32_t* err, uint32_t code, void* stream);
+
 /// STRATA_EP_VERIFY=1: add to *mismatch (host) the peer-owned rows where peer_rows (read past the caches, as
 /// ep_copy_uncached) differs from this card's parts.
 void ep_compare(const float* parts, const float* peer_rows, const int32_t* ids, const int32_t* res0, int n, int64_t row,

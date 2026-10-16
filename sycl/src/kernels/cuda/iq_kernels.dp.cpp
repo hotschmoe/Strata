@@ -4982,6 +4982,60 @@ void iq_dequant_expert_f16(int gt, int dt, const void* gate, const void* up, con
     check("iq_dequant_expert_f16");
 }
 
+// Night lab (STRATA_NIGHT_PREFILL_WAVE): up to kDqGroupMax experts' gate/up and down matrices in ONE launch, each
+// expert's values exactly iq_dequant_expert_f16's (the same dq_dispatch per superblock); dimension 1 of the grid is the
+// expert.  The blob pointers are picked with constant indices only (a dynamically indexed by-value array lands in
+// private memory: measured 34 ms instead of ~0.2 ms for 16 experts), the outputs are slots at a fixed stride.
+namespace {
+struct DqBlobs { const uint8_t* b[kDqGroupMax]; };
+static_assert(kDqGroupMax == 16, "dq_pick below lists 16 cases");
+inline const uint8_t* dq_pick(const DqBlobs& g, int e) {
+    switch (e) {
+        case 0: return g.b[0];   case 1: return g.b[1];   case 2: return g.b[2];   case 3: return g.b[3];
+        case 4: return g.b[4];   case 5: return g.b[5];   case 6: return g.b[6];   case 7: return g.b[7];
+        case 8: return g.b[8];   case 9: return g.b[9];   case 10: return g.b[10]; case 11: return g.b[11];
+        case 12: return g.b[12]; case 13: return g.b[13]; case 14: return g.b[14]; default: return g.b[15];
+    }
+}
+}  // namespace
+void iq_dequant_experts_f16(int gt, int dt, int n, const uint8_t* const* blob, size_t up_off, size_t down_off,
+                            int64_t n_ff, int64_t n_embd, uint16_t* dst_gu, uint16_t* dst_d, void* stream) {
+    if (n <= 0) return;
+    if (n > kDqGroupMax || n_embd % 256 != 0 || (n_ff * n_embd) % 256 != 0 || !is_iq(gt) || !is_iq(dt)) {
+        std::fprintf(stderr, "iq_dequant_experts_f16: types %d/%d, %lld x %lld, n %d\n", gt, dt, (long long) n_ff,
+                     (long long) n_embd, n);
+        std::exit(1);
+    }
+    DqBlobs g{};
+    for (int i = 0; i < kDqGroupMax; ++i) g.b[i] = blob[i < n ? i : 0];
+    const int64_t per_row = n_embd / 256, gu_wgs = 2 * n_ff * per_row, d_wgs = n_ff * n_embd / 256;
+    const int64_t gu_elems = 2 * n_ff * n_embd, d_elems = n_ff * n_embd;
+    sycl::half* ygu0 = (sycl::half*) dst_gu;
+    sycl::half* yd0 = (sycl::half*) dst_d;
+    strata::q_of(stream)->submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<class night_dequant_experts_kernel>(
+            sycl::nd_range<3>(sycl::range(1, (size_t) n, (size_t) (gu_wgs + d_wgs) * 32), sycl::range(1, 1, 32)),
+            [=](sycl::nd_item<3> it) {
+                const int e = (int) it.get_group(1);
+                const int64_t wg = it.get_group(2);
+                const uint8_t* bd = dq_pick(g, e);
+                if (wg < gu_wgs) {
+                    const int64_t i = wg >> 1;
+                    const int parity = (int) (wg & 1);
+                    const int64_t r = i / per_row, c = i % per_row;
+                    dq_dispatch<sycl::half>(gt, parity ? (const void*) (bd + up_off) : (const void*) bd, i,
+                                            ygu0 + e * gu_elems + ((2 * r + parity) * per_row + c) * QK_K,
+                                            it.get_local_id(2));
+                } else {
+                    const int64_t j = wg - gu_wgs;
+                    dq_dispatch<sycl::half>(dt, (const void*) (bd + down_off), j, yd0 + e * d_elems + j * QK_K,
+                                            it.get_local_id(2));
+                }
+            });
+    });
+    check("iq_dequant_experts_f16");
+}
+
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept {
     const int qg = gu_qk(gu_type), qd = d_qk(d_type);
     return qg > 0 && qd > 0 && is_iq(gu_type) && is_iq(d_type) && n_embd % qg == 0 && n_ff % qd == 0 &&
