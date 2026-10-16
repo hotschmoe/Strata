@@ -1718,8 +1718,25 @@ void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream) {
     check("dense_steps");
 }
 
+bool verify_t12() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_NIGHT_VERIFY_T12");
+        const bool b = e != nullptr && e[0] == '1';
+        if (b) std::fprintf(stderr, "strata night: STRATA_NIGHT_VERIFY_T12=1 (verify windows of up to 12 rows)\n");
+        return b;
+    }();
+    return on;
+}
+int verify_max_t() { return verify_t12() ? 12 : kVerifyMaxT; }
 void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels,
                        int qk_heads, float eps, int n_tok, void* stream, int t_begin, bool commit) {
+    if (n_tok > kVerifyMaxT && !commit && verify_t12() && n_tok <= kVerifyCapT) {   // night T12: rows [0, 8) and [8, n)
+        // token t reads [history | qkv_0 .. qkv_t]: the second call keeps the same buffers and starts at t_begin + 8
+        gdn_conv_l2_multi(history, qkv, conv_w, h, channels, qk_heads, eps, kVerifyMaxT, stream, t_begin, false);
+        gdn_conv_l2_multi(history, qkv, conv_w, h, channels, qk_heads, eps, n_tok - kVerifyMaxT, stream,
+                          t_begin + kVerifyMaxT, false);
+        return;
+    }
     if (!history || !qkv || !conv_w || !h || channels % S != 0 || n_tok < 1 || n_tok > kVerifyMaxT ||
         (commit && (n_tok != 1 || t_begin != 0))) {
         std::fprintf(stderr, "gdn_conv_l2_multi: invalid arguments\n");
@@ -1815,6 +1832,12 @@ bool night_gdn_ab() {
 void gdn_ab_set_night(int on) { g_night_gdn_ab_force = on; }
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream) {
+    if (n_tok > kVerifyMaxT && verify_t12() && n_tok <= kVerifyCapT) {   // night T12: column-independent, chunked
+        gdn_ab_multi(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, kVerifyMaxT, stream);
+        gdn_ab_multi(x + (size_t) kVerifyMaxT * n_embd, w_alpha, w_beta, dt, ssm_a, gate + (size_t) kVerifyMaxT * h_v,
+                     beta + (size_t) kVerifyMaxT * h_v, n_embd, h_v, n_tok - kVerifyMaxT, stream);
+        return;
+    }
     if (n_embd % 8 != 0 || n_tok < 1 || n_tok > kVerifyMaxT) {
         std::fprintf(stderr, "gdn_ab_multi: invalid arguments\n");
         std::exit(1);

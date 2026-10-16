@@ -2,6 +2,7 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "s26_tsum.dp.hpp"
 #include "strata/kernels/bf16_bits.hpp"
@@ -580,6 +581,11 @@ bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* 
 
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream) {
+    if (n_tok > 8 && verify_t12() && n_tok <= kVerifyCapT) {   // night T12: rows [0, 8) and [8, n) (row-independent)
+        bf16_gemv_fp32_mmvf_multi(x, ldx, w, y, ldy, n_in, n_out, 8, stream);
+        bf16_gemv_fp32_mmvf_multi(x + (size_t) ldx * 8, ldx, w, y + (size_t) ldy * 8, ldy, n_in, n_out, n_tok - 8, stream);
+        return;
+    }
     if (n_tok == 1 && ldy >= n_out) { bf16_gemv_fp32_mmvf(x, w, y, n_in, n_out, stream); return; }
     if (n_tok < 1 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || n_out <= 0 || (ldx & 1) != 0 || x == nullptr ||
         w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)

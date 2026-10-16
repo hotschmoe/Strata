@@ -19,6 +19,13 @@
 namespace strata::kernels {
 
 inline constexpr int kVerifyMaxT = 8;
+/// night lab STRATA_NIGHT_VERIFY_T12=1 (default off): a verify window may hold 12 rows (C4 with
+/// STRATA_BATCH_MTP_DEPTH=2: 4 slots x 3 rows).  kVerifyCapT sizes the host-side arrays; verify_max_t() is the
+/// window cap the engine uses (12 with the flag, else kVerifyMaxT).  Kernels with an 8-row cap chunk the rows at
+/// their entry points (rows 0-7, 8-11) only when called with more than 8 rows.
+inline constexpr int kVerifyCapT = 16;
+bool verify_t12();
+int verify_max_t();
 
 /// For token t of T: conv over [history(3) | qkv_0 .. qkv_t] -> SiLU -> L2 norm of the q/k heads -> h[t].
 /// `history` is NOT written, but with `commit` (one token): it then keeps the token, as gdn_conv_commit.  Bitwise

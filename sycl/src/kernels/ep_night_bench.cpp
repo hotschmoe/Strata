@@ -13,6 +13,11 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/ep_kernels.hpp"
+#include <type_traits>
+#include "strata/kernels/fused_gr.hpp"
+#include "strata/kernels/shared_expert.hpp"
+#include "strata/kernels/bf16_gemv.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
@@ -656,6 +661,189 @@ int gdnstep_bench(int reps) {
     return bad ? 1 : 0;
 }
 
+// ------------------------------------------------------------------------------------------------ t12 (VERIFY_T12)
+// Each entry point that chunks above 8 rows (STRATA_NIGHT_VERIFY_T12=1): the 12-row call against the same entry called
+// on rows [0, 8) and [8, 12) with offset pointers (must be memcmp-equal: the offsets are right), and for MMVQ against
+// two 6-row calls (the column arithmetic of a 6- vs 8-/4-column kernel; reported).
+size_t blk_bytes(int t) { return k::iq_row_bytes(t, (t == 20 || t == 8) ? 32 : t == 42 ? 64 : 256); }
+std::vector<uint8_t> rand_w(int t, int64_t rows, int64_t n, std::mt19937& rng) {
+    const size_t rb = k::iq_row_bytes(t, n), bs = blk_bytes(t);
+    std::vector<uint8_t> w((size_t) rows * rb);
+    std::uniform_int_distribution<int> byte(0, 255), ex(1, 5), man(0, 1023), sgn(0, 1);
+    for (auto& b : w) b = (uint8_t) byte(rng);
+    for (size_t o = 0; o < w.size(); o += bs) {
+        auto h = [&] { return (uint16_t) ((sgn(rng) ? 0x8000 : 0) | (ex(rng) << 10) | man(rng)); };
+        if (t == 14) { const uint16_t d = h(); std::memcpy(&w[o + 208], &d, 2); }
+        else {
+            const uint16_t d = h(); std::memcpy(&w[o], &d, 2);
+            if (t == 12 || t == 13) { const uint16_t m = h(); std::memcpy(&w[o + 2], &m, 2); }
+        }
+    }
+    return w;
+}
+template <class T> T* up(sycl::queue& q, const std::vector<T>& h) { T* d = sycl::malloc_device<T>(h.size() + 64, q); q.memcpy(d, h.data(), h.size() * sizeof(T)).wait(); return d; }
+template <class T> std::vector<T> down(sycl::queue& q, const T* d, size_t n) { std::vector<T> h(n); q.memcpy(h.data(), d, n * sizeof(T)).wait(); return h; }
+struct Cmp { bool same = true; double max_rel = 0; };
+template <class T> Cmp cmpv(const std::vector<T>& a, const std::vector<T>& b) {
+    Cmp c; c.same = !std::memcmp(a.data(), b.data(), a.size() * sizeof(T));
+    if constexpr (std::is_floating_point_v<T>)
+        for (size_t i = 0; i < a.size(); ++i) {
+            const double d = std::fabs((double) a[i] - (double) b[i]), m = std::fabs((double) a[i]);
+            if (m > 1e-6) c.max_rel = std::max(c.max_rel, d / m);
+        }
+    return c;
+}
+int t12_bench() {
+    sycl::queue& q = Q();
+    std::mt19937 rng(1212);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    const int T = 12;
+    int bad = 0;
+    auto report = [&](const char* what, bool same, double rel6 = -1) {
+        bad += !same;
+        if (rel6 >= 0) std::printf("t12 %-34s 12 rows vs [0,8)+[8,12): %s; vs 6+6 rows max rel %.3g\n", what, same ? "bitwise" : "FAIL", rel6);
+        else std::printf("t12 %-34s 12 rows vs [0,8)+[8,12): %s\n", what, same ? "bitwise" : "FAIL");
+    };
+    // quantize
+    const int NI = 2560;
+    std::vector<float> x((size_t) T * NI);
+    for (auto& v : x) v = nd(rng);
+    float* d_x = up(q, x);
+    const size_t xr = (size_t) (NI / 32) * 36;
+    uint8_t* xq12 = sycl::malloc_device<uint8_t>(xr * T, q);
+    uint8_t* xq84 = sycl::malloc_device<uint8_t>(xr * T, q);
+    k::native_quantize_q8_1(d_x, xq12, NI, T, &q);
+    k::native_quantize_q8_1(d_x, xq84, NI, 8, &q);
+    k::native_quantize_q8_1(d_x + 8 * NI, xq84 + 8 * xr, NI, 4, &q);
+    q.wait();
+    report("native_quantize_q8_1", cmpv(down(q, xq12, xr * T), down(q, xq84, xr * T)).same);
+    // MMVQ, every format the window uses
+    for (int t : {12, 13, 14, 23, 21, 20, 8, 42}) {
+        const int NO = 1024;
+        auto w = rand_w(t, NO, NI, rng);
+        uint8_t* d_w = up(q, w);
+        float* y12 = sycl::malloc_device<float>((size_t) T * NO, q);
+        float* y84 = sycl::malloc_device<float>((size_t) T * NO, q);
+        float* y66 = sycl::malloc_device<float>((size_t) T * NO, q);
+        k::native_mmvq(t, d_w, xq12, y12, NI, NO, T, &q);
+        k::native_mmvq(t, d_w, xq12, y84, NI, NO, 8, &q);
+        k::native_mmvq(t, d_w, xq12 + 8 * xr, y84 + 8 * NO, NI, NO, 4, &q);
+        k::native_mmvq(t, d_w, xq12, y66, NI, NO, 6, &q);
+        k::native_mmvq(t, d_w, xq12 + 6 * xr, y66 + 6 * NO, NI, NO, 6, &q);
+        q.wait();
+        const auto a = down(q, y12, (size_t) T * NO), b = down(q, y84, (size_t) T * NO), c = down(q, y66, (size_t) T * NO);
+        char nm[48]; std::snprintf(nm, sizeof nm, "native_mmvq type %d 2560->1024", t);
+        report(nm, cmpv(a, b).same, cmpv(a, c).max_rel);
+        for (void* p : {(void*) d_w, (void*) y12, (void*) y84, (void*) y66}) sycl::free(p, q);
+    }
+    // BF16 multi GEMV (the router 2560 -> 512)
+    {
+        std::vector<uint16_t> w((size_t) 512 * NI);
+        for (auto& v : w) { float f = 0.05f * nd(rng); uint32_t u; std::memcpy(&u, &f, 4); v = (uint16_t) (u >> 16); }
+        uint16_t* d_w = up(q, w);
+        float* y12 = sycl::malloc_device<float>((size_t) T * 512, q);
+        float* y84 = sycl::malloc_device<float>((size_t) T * 512, q);
+        k::bf16_gemv_fp32_mmvf_multi(d_x, NI, d_w, y12, 512, NI, 512, T, &q);
+        k::bf16_gemv_fp32_mmvf_multi(d_x, NI, d_w, y84, 512, NI, 512, 8, &q);
+        k::bf16_gemv_fp32_mmvf_multi(d_x + 8 * NI, NI, d_w, y84 + 8 * 512, 512, NI, 512, 4, &q);
+        q.wait();
+        report("bf16_gemv_fp32_mmvf_multi 2560->512", cmpv(down(q, y12, (size_t) T * 512), down(q, y84, (size_t) T * 512)).same);
+        for (void* p : {(void*) d_w, (void*) y12, (void*) y84}) sycl::free(p, q);
+    }
+    // GDN ab + conv/l2
+    {
+        const int hv = 48, C = 10240;
+        std::vector<uint16_t> wa((size_t) hv * NI), wb((size_t) hv * NI);
+        for (auto* v : {&wa, &wb}) for (auto& e : *v) { float f = 0.05f * nd(rng); uint32_t u; std::memcpy(&u, &f, 4); e = (uint16_t) (u >> 16); }
+        std::vector<float> dt(hv), sa(hv);
+        for (auto& e : dt) e = nd(rng);
+        for (auto& e : sa) e = -std::fabs(nd(rng));
+        uint16_t *d_wa = up(q, wa), *d_wb = up(q, wb);
+        float *d_dt = up(q, dt), *d_sa = up(q, sa);
+        float* g12 = sycl::malloc_device<float>(T * hv, q); float* b12 = sycl::malloc_device<float>(T * hv, q);
+        float* g84 = sycl::malloc_device<float>(T * hv, q); float* b84 = sycl::malloc_device<float>(T * hv, q);
+        k::gdn_ab_multi(d_x, d_wa, d_wb, d_dt, d_sa, g12, b12, NI, hv, T, &q);
+        k::gdn_ab_multi(d_x, d_wa, d_wb, d_dt, d_sa, g84, b84, NI, hv, 8, &q);
+        k::gdn_ab_multi(d_x + 8 * NI, d_wa, d_wb, d_dt, d_sa, g84 + 8 * hv, b84 + 8 * hv, NI, hv, 4, &q);
+        q.wait();
+        report("gdn_ab_multi", cmpv(down(q, g12, T * hv), down(q, g84, T * hv)).same && cmpv(down(q, b12, T * hv), down(q, b84, T * hv)).same);
+        std::vector<float> hist((size_t) C * 3), qkv((size_t) T * C), cw((size_t) C * 4);
+        for (auto* v : {&hist, &qkv, &cw}) for (auto& e : *v) e = 0.3f * nd(rng);
+        float *d_hist = up(q, hist), *d_qkv = up(q, qkv), *d_cw = up(q, cw);
+        float* h12 = sycl::malloc_device<float>((size_t) T * C, q); float* h84 = sycl::malloc_device<float>((size_t) T * C, q);
+        k::gdn_conv_l2_multi(d_hist, d_qkv, d_cw, h12, C, 32, 1e-6f, T, &q);
+        k::gdn_conv_l2_multi(d_hist, d_qkv, d_cw, h84, C, 32, 1e-6f, 8, &q, 0, false);
+        k::gdn_conv_l2_multi(d_hist, d_qkv, d_cw, h84, C, 32, 1e-6f, 4, &q, 8, false);
+        q.wait();
+        report("gdn_conv_l2_multi", cmpv(down(q, h12, (size_t) T * C), down(q, h84, (size_t) T * C)).same);
+        for (void* p : {(void*) d_wa, (void*) d_wb, (void*) d_dt, (void*) d_sa, (void*) g12, (void*) b12, (void*) g84, (void*) b84,
+                        (void*) d_hist, (void*) d_qkv, (void*) d_cw, (void*) h12, (void*) h84}) sycl::free(p, q);
+    }
+    // shared expert (IQ3_S gate/up 2560 -> 640, IQ4_NL down 640 -> 2560, BF16 gate row)
+    {
+        const int FF = 640;
+        auto wg = rand_w(21, FF, NI, rng), wu = rand_w(21, FF, NI, rng), wd = rand_w(20, NI, FF, rng);
+        std::vector<uint16_t> gi(NI);
+        for (auto& e : gi) { float f = 0.05f * nd(rng); uint32_t u; std::memcpy(&u, &f, 4); e = (uint16_t) (u >> 16); }
+        uint8_t *d_wg = up(q, wg), *d_wu = up(q, wu), *d_wd = up(q, wd);
+        uint16_t* d_gi = up(q, gi);
+        std::vector<uint16_t> xb((size_t) T * NI);
+        for (size_t i = 0; i < xb.size(); ++i) { uint32_t u; std::memcpy(&u, &x[i], 4); xb[i] = (uint16_t) (u >> 16); }
+        uint16_t* d_xb = up(q, xb);
+        uint8_t* scr = sycl::malloc_device<uint8_t>(xr * 16 + (size_t) 16 * (FF / 32) * 36, q);
+        float* gate = sycl::malloc_device<float>((size_t) T * FF, q); float* upb = sycl::malloc_device<float>((size_t) T * FF, q);
+        float* gg[2] = {sycl::malloc_device<float>(T, q), sycl::malloc_device<float>(T, q)};
+        float* out[2] = {sycl::malloc_device<float>((size_t) T * NI, q), sycl::malloc_device<float>((size_t) T * NI, q)};
+        k::NativeSharedWeights nw;
+        nw.gate_type = 21; nw.gate_data = d_wg; nw.up_type = 21; nw.up_data = d_wu; nw.down_type = 20; nw.down_data = d_wd;
+        nw.q8_1 = scr;
+        k::shared_expert_multi(T, d_x, d_xb, nw, d_gi, gate, upb, gg[0], out[0], NI, FF, &q, nullptr, 0);
+        k::shared_expert_multi(8, d_x, d_xb, nw, d_gi, gate, upb, gg[1], out[1], NI, FF, &q, nullptr, 0);
+        k::shared_expert_multi(4, d_x + 8 * NI, d_xb + 8 * NI, nw, d_gi, gate + 8 * FF, upb + 8 * FF, gg[1] + 8, out[1] + 8 * NI, NI, FF, &q, nullptr, 0);
+        q.wait();
+        report("shared_expert_multi (IQ3_S/IQ4_NL)", cmpv(down(q, out[0], (size_t) T * NI), down(q, out[1], (size_t) T * NI)).same &&
+                                                     cmpv(down(q, gg[0], T), down(q, gg[1], T)).same);
+        for (void* p : {(void*) d_wg, (void*) d_wu, (void*) d_wd, (void*) d_gi, (void*) d_xb, (void*) scr, (void*) gate, (void*) upb,
+                        (void*) gg[0], (void*) gg[1], (void*) out[0], (void*) out[1]}) sycl::free(p, q);
+    }
+    // the HC read (BF16 weights: the per-layer read with inject, no pending write)
+    {
+        const int D = 10240, LR = 320, HCn = 4;
+        auto bfv = [&](size_t n, float s) { std::vector<uint16_t> v(n); for (auto& e : v) { float f = s * nd(rng); uint32_t u; std::memcpy(&u, &f, 4); e = (uint16_t) (u >> 16); } return v; };
+        std::vector<float> R((size_t) T * D), wn(D);
+        for (auto& e : R) e = nd(rng);
+        for (auto& e : wn) e = 1.0f + 0.1f * nd(rng);
+        float *d_R = up(q, R), *d_wn = up(q, wn);
+        uint16_t *d_wd = up(q, bfv((size_t) LR * D, 0.02f)), *d_wu = up(q, bfv((size_t) D * LR, 0.02f)), *d_wi = up(q, bfv((size_t) HCn * D, 0.02f));
+        float* lo[2]; float* rs[2]; float* io[2]; float* mx[2]; float* xn[2];
+        for (int v = 0; v < 2; ++v) {
+            lo[v] = sycl::malloc_device<float>((size_t) T * LR, q); rs[v] = sycl::malloc_device<float>(T * HCn, q);
+            io[v] = sycl::malloc_device<float>(T * HCn, q); mx[v] = sycl::malloc_device<float>((size_t) T * 2560, q);
+            xn[v] = sycl::malloc_device<float>((size_t) T * D, q);
+        }
+        auto args = [&](int v, int t) {
+            k::FusedGrArgs a;
+            a.R = d_R + (size_t) t * D; a.R_out = const_cast<float*>(a.R); a.apply = false;
+            a.w_norm = d_wn; a.w_down = d_wd; a.w_up = d_wu; a.w_inject = d_wi; a.eps = 1e-6f;
+            a.lo = lo[v] + t * LR; a.rs = rs[v] + t * HCn; a.inject_out = io[v] + t * HCn; a.mixed = mx[v] + (size_t) t * 2560;
+            return a;
+        };
+        k::FusedGrArgs f0[16], f1[16];
+        for (int t = 0; t < T; ++t) { f0[t] = args(0, t); f1[t] = args(1, t); }
+        k::fused_gr_read_multi(f0, T, xn[0], &q);
+        k::fused_gr_read_multi(f1, 8, xn[1], &q);
+        k::fused_gr_read_multi(f1 + 8, 4, xn[1] + (size_t) 8 * D, &q);
+        q.wait();
+        report("fused_gr_read_multi (HC read)", cmpv(down(q, mx[0], (size_t) T * 2560), down(q, mx[1], (size_t) T * 2560)).same &&
+                                               cmpv(down(q, io[0], T * HCn), down(q, io[1], T * HCn)).same);
+        for (void* p : {(void*) d_R, (void*) d_wn, (void*) d_wd, (void*) d_wu, (void*) d_wi}) sycl::free(p, q);
+        for (int v = 0; v < 2; ++v) for (void* p : {(void*) lo[v], (void*) rs[v], (void*) io[v], (void*) mx[v], (void*) xn[v]}) sycl::free(p, q);
+    }
+    for (void* p : {(void*) d_x, (void*) xq12, (void*) xq84}) sycl::free(p, q);
+    std::printf("t12: %d failures (verify_max_t() = %d)\n", bad, k::verify_max_t());
+    return bad ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -665,6 +853,7 @@ int main(int argc, char** argv) {
     if (mode == "plan") return plan_bench(argc > 2 ? std::atoi(argv[2]) : 20);
     if (mode == "router") return router_bench(argc > 2 ? std::atoi(argv[2]) : 20);
     if (mode == "gdnab") return gdnab_bench(argc > 2 ? std::atoi(argv[2]) : 20);
+    if (mode == "t12") return t12_bench();
     if (mode == "gdnstep") return gdnstep_bench(argc > 2 ? std::atoi(argv[2]) : 20);
     std::fprintf(stderr, "usage: ep_night_bench grouped|send\n");
     return 2;

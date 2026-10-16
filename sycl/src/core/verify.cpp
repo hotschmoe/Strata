@@ -520,8 +520,12 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     max_t_ = max_t;
     sampling_.greedy = true;      // a fresh verifier samples greedily until set_sampling says otherwise
     sampling_.temperature = 0.0f;
-    if (max_t < 2 || max_t > strata::kernels::kVerifyMaxT || max_t > strata::kernels::cpu::MAXT) {
-        err = "verify: the window must hold 2.." + std::to_string(strata::kernels::kVerifyMaxT) + " tokens";
+    // night STRATA_NIGHT_VERIFY_T12: up to 12 rows; the CPU expert pool's rows stay capped at cpu::MAXT, so a wider
+    // window needs every routed expert on a GPU (expert parallel, checked in ep_init / the device plan)
+    if (max_t < 2 || max_t > strata::kernels::verify_max_t() ||
+        (max_t > strata::kernels::cpu::MAXT && !(strata::kernels::verify_t12() && ep_on()))) {
+        err = "verify: the window must hold 2.." + std::to_string(strata::kernels::verify_max_t()) + " tokens" +
+              (max_t > strata::kernels::cpu::MAXT ? " (more than 8: expert parallel only)" : "");
         return false;
     }
     if (hits.d_res == nullptr || hits.cache_base == nullptr || hits.blob <= 0) {
@@ -1033,7 +1037,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             pending = false;
         }
         auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out) {
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kVerifyCapT];
             for (int t = tb; t < te; ++t) {
                 FusedGrArgs& a = fa[t - tb];
                 a.R = Rt(t); a.R_out = Rt(t); a.apply = apply;
@@ -1822,7 +1826,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
         // (no pending write, no inject)
         const bool mix_q8 = hd->hc_q8 != nullptr && hu->hc_q8 != nullptr && head_ != nullptr && head_->loaded();
         if (mix_q8) {
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kVerifyCapT];
             for (int t = 0; t < T; ++t) {
                 FusedGrArgs& a = fa[t];
                 a.R = Rt(t); a.R_out = Rt(t); a.apply = false;
@@ -1835,7 +1839,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             fused_gr_read_multi(fa, T, xn_, cs);
         }
         else if (fuse_head_gr) {
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kVerifyCapT];
             for (int t = 0; t < T; ++t) {
                 FusedGrArgs& a = fa[t];
                 a.R = Rt(t); a.R_out = Rt(t); a.apply = true;
@@ -1858,7 +1862,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                 err = "verify: the output_hc_* weights have the wrong engine forms";
                 return false;
             }
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kVerifyCapT];
             for (int t = 0; t < T; ++t) {
                 fa[t].R = Rt(t); fa[t].R_out = Rt(t); fa[t].apply = false;
                 fa[t].w_norm = (const float*) hn->data; fa[t].w_down = (const uint16_t*) hd->data;
@@ -2426,7 +2430,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     if (!staged_) stage_inputs(T, tokens, pos0);
     staged_ = false;
     const bool do_ple = ss.ple.ready() && ple_stage();
-    uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];
+    uint32_t ple_rows[kVerifyCapT * PLE_N_HEADS];
     if (do_ple) {
         int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
         for (int t = 0; t < T; ++t) {
@@ -3591,7 +3595,7 @@ bool Verifier::stage_batch(const int *rows, int S, int hbase,
         for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t) pos[t];
     }
     if (ss_->ple.ready() && ple_stage()) {
-        uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];   // (not `rows`: that is the slots of the window's rows)
+        uint32_t ple_rows[kVerifyCapT * PLE_N_HEADS];   // (not `rows`: that is the slots of the window's rows)
         for (int t = 0; t < S; ++t) {
             const SessionState& sx = *slots_[(size_t) rows[t]];
             int32_t prev[2] = {sx.ple_prev[0], sx.ple_prev[1]};
@@ -3640,8 +3644,8 @@ catch (sycl::exception const &exc) {
 
 bool Verifier::run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
                          std::string& err) {
-    int rows[8] = {};
-    for (int t = 0; t < S && t < 8; ++t) rows[t] = t;
+    int rows[strata::kernels::kVerifyCapT] = {};
+    for (int t = 0; t < S && t < strata::kernels::kVerifyCapT; ++t) rows[t] = t;
     return run_slot_rows(rows, S, tokens, pos, pool, user, out, err);
 }
 
@@ -3921,8 +3925,8 @@ bool Verifier::batch_launch(int base, int S, const int32_t *tokens,
                             const int64_t *pos, std::string &err) try {
     const OnDevice on_device(device_);
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
-    int rows[8] = {};
-    for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
+    int rows[strata::kernels::kVerifyCapT] = {};
+    for (int t = 0; t < S && t < strata::kernels::kVerifyCapT; ++t) rows[t] = base + t;
     if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
     if (ep_on()) ep_q_->ext_oneapi_graph(*ep_exec_bm_[bkey(rows, S, base)]);   // the peer's half first, as run()
     dpct::err0 le = DPCT_CHECK_ERROR(
@@ -4153,7 +4157,7 @@ bool Verifier::capture_all(std::string &err) try {
                                functionality is redundant in SYCL.
                                */
     }
-    pl_ple_rows_.assign((size_t) strata::kernels::kVerifyMaxT * strata::kernels::PLE_N_HEADS, 0u);
+    pl_ple_rows_.assign((size_t) strata::kernels::kVerifyCapT * strata::kernels::PLE_N_HEADS, 0u);
     return true;
 }
 catch (sycl::exception const &exc) {

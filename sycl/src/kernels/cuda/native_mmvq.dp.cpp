@@ -29,6 +29,7 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_math.hpp"
 #include "strata/sycl_queue.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_head_mmvq.hpp"
 #include "strata/kernels/dp4a.hpp"
@@ -4604,6 +4605,12 @@ std::size_t native_q8_1_bytes(int n_in, int ncols) {
 }
 
 void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, void* stream) {
+    if (ncols > MAX_NCOLS && verify_t12() && ncols <= kVerifyCapT) {   // night T12: per 32-element block, chunked
+        native_quantize_q8_1(x, x_q8_1, n_in, MAX_NCOLS, stream);
+        native_quantize_q8_1(x + (size_t) n_in * MAX_NCOLS, (uint8_t*) x_q8_1 + (size_t) (n_in / 32) * 36 * MAX_NCOLS,
+                             n_in, ncols - MAX_NCOLS, stream);
+        return;
+    }
     validate_shape(n_in, ncols);
     validate_pointer(x);
     validate_pointer(x_q8_1);
@@ -5378,8 +5385,28 @@ void native_mmvq_head(int ggml_type, const void* weights, const void* x_q8_1, fl
     native_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream);
 }
 
+void native_mmvq_dispatch(int ggml_type, const void* weights, const void* x_q8_1, float* y,
+                          int n_in, int n_out, int ncols, void* stream);
+// night lab STRATA_NIGHT_VERIFY_T12: more than 8 columns (a 12-row verify window).  The KREG formats take 9-16 columns
+// whole where STRATA_NIGHT_MMVQ2 enables it (one weight read); every other kernel caps at 8, so the columns go as
+// [0, 8) and [8, n) - each column's arithmetic is that column's in the narrower call.
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream) {
+    if (ncols > MAX_NCOLS && verify_t12() && ncols <= kVerifyCapT) {
+        if (ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 23) {
+            try { native_mmvq_dispatch(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); return; }
+            catch (const std::invalid_argument&) {}   // not taken whole (nothing was launched): chunk below
+        }
+        const size_t xcol = (size_t) (n_in / 32) * 36;
+        native_mmvq_dispatch(ggml_type, weights, x_q8_1, y, n_in, n_out, MAX_NCOLS, stream);
+        native_mmvq(ggml_type, weights, (const uint8_t*) x_q8_1 + xcol * MAX_NCOLS, y + (size_t) n_out * MAX_NCOLS,
+                    n_in, n_out, ncols - MAX_NCOLS, stream);
+        return;
+    }
+    native_mmvq_dispatch(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream);
+}
+void native_mmvq_dispatch(int ggml_type, const void* weights, const void* x_q8_1, float* y,
+                          int n_in, int n_out, int ncols, void* stream) {
     switch (ggml_type) {
     case 2: native_q4_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 6: native_q5_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;

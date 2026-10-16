@@ -22,6 +22,7 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/bf16_bits.hpp"
@@ -322,6 +323,17 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
                          int64_t n_ff, void* stream, const void* x_q8_1_ready, int lfuse) {
     const bool gate_deferred = (lfuse & 1) != 0, pair = (lfuse & 2) != 0;
+    if (n_tok > 8 && verify_t12() && n_tok <= kVerifyCapT) {   // night T12: rows [0, 8) and [8, n); the scratch is reused
+        const size_t xrow = (size_t) (n_embd / 32) * 36;
+        shared_expert_multi(8, x, x_bf16, nw, gate_inp_bf16, gate, up, g, out, n_embd, n_ff, stream, x_q8_1_ready, lfuse);
+        NativeSharedWeights w2 = nw;
+        if (w2.x_q8_1) w2.x_q8_1 = (const uint8_t*) w2.x_q8_1 + xrow * 8;
+        shared_expert_multi(n_tok - 8, x ? x + (size_t) n_embd * 8 : nullptr, x_bf16 ? x_bf16 + (size_t) n_embd * 8 : nullptr,
+                            w2, gate_inp_bf16, gate ? gate + (size_t) n_ff * 8 : nullptr, up ? up + (size_t) n_ff * 8 : nullptr,
+                            g ? g + 8 : nullptr, out + (size_t) n_embd * 8, n_embd, n_ff, stream,
+                            x_q8_1_ready ? (const uint8_t*) x_q8_1_ready + xrow * 8 : nullptr, lfuse);
+        return;
+    }
     if (n_tok < 1 || n_tok > 8 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
         throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens, native weights, scratch and a stream");
     dpct::queue_ptr cs = strata::q_of(stream);

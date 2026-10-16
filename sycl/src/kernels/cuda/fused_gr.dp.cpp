@@ -1771,6 +1771,14 @@ static float* down_partials(sycl::queue* q) {
 
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
                          int stamp_i0) {
+    if (n_tok > kFusedGrMaxT && verify_t12() && n_tok <= kVerifyCapT && xn_scratch != nullptr && a[0].q8_cnt == nullptr) {
+        // night T12: rows [0, 8) and [8, n), each row's read is its own; xn holds hc * n_embd floats per row
+        const size_t row = (size_t) D;   // hc * n_embd
+        const bool r0 = fused_gr_read_multi(a, kFusedGrMaxT, xn_scratch, stream, stamp_buf, stamp_i0);
+        const bool r1 = fused_gr_read_multi(a + kFusedGrMaxT, n_tok - kFusedGrMaxT, xn_scratch + row * kFusedGrMaxT, stream,
+                                            nullptr, stamp_i0);
+        return r0 && r1;
+    }
     if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
         std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
         std::exit(1);

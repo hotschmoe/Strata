@@ -4040,7 +4040,7 @@ int main(int argc, char **argv) try {
     }
     std::vector<std::vector<std::unique_ptr<strata::core::SessionState>>> bslot_ss;
     if (o.batch != 0) {
-        const int cap = strata::kernels::kVerifyMaxT;
+        const int cap = strata::kernels::verify_max_t();
         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
                         : split_same ? "it needs each stage of a layer split on its own GPU" : nullptr;
         if (off != nullptr) {
@@ -7333,7 +7333,7 @@ int main(int argc, char **argv) try {
         // the widest window; a request without penalties gets a null buffer and takes the byte-for-byte
         // neutral path (no upload, no buffer handed to the sampler).
         constexpr int kPenaltyWindowCap = 4096;
-        constexpr size_t kHistSlots = (size_t) kPenaltyWindowCap * (size_t) strata::kernels::kVerifyMaxT;
+        constexpr size_t kHistSlots = (size_t) kPenaltyWindowCap * (size_t) strata::kernels::kVerifyCapT;
         int32_t* d_hist = nullptr;
         std::vector<int32_t> hist_stage(kHistSlots, -1);
         const int hist_dev = last_st ? last_st->dev : -1;   // with the head: the last stage's device
@@ -7537,7 +7537,7 @@ int main(int argc, char **argv) try {
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (ep_cfg.device >= 0) ver.set_ep(ep_cfg);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
-                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
+                      batch_mtp ? strata::kernels::verify_max_t() : std::max(o.spec, o.batch), err) ||
             (use_mtp && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
@@ -9139,7 +9139,7 @@ int main(int argc, char **argv) try {
         struct BSlot {
             bool active = false, stop = false;
             int32_t x = 0;                 ///< the token the next window feeds (not yet in the slot's state)
-            std::array<int32_t, strata::kernels::kVerifyMaxT> draft{}; ///< the slot's next MTP proposal
+            std::array<int32_t, strata::kernels::kVerifyCapT> draft{}; ///< the slot's next MTP proposal
             bool draft_ready = false;
             int n_draft = 0;               ///< the drafts `draft` holds (what the drafter returned, <= the depth)
             int64_t p = 0;                 ///< its position
@@ -9445,16 +9445,16 @@ int main(int argc, char **argv) try {
         // so it keeps the conversation it holds
         auto batch_step = [&]() -> bool {
             int S = 0;
-            int rows[strata::kernels::kVerifyMaxT] = {};
-            int32_t tok[strata::kernels::kVerifyMaxT] = {}, outb[strata::kernels::kVerifyMaxT] = {};
-            int64_t pos[strata::kernels::kVerifyMaxT] = {};
-            int first[strata::kernels::kVerifyMaxT] = {}, active[strata::kernels::kVerifyMaxT] = {};
+            int rows[strata::kernels::kVerifyCapT] = {};
+            int32_t tok[strata::kernels::kVerifyCapT] = {}, outb[strata::kernels::kVerifyCapT] = {};
+            int64_t pos[strata::kernels::kVerifyCapT] = {};
+            int first[strata::kernels::kVerifyCapT] = {}, active[strata::kernels::kVerifyCapT] = {};
             static size_t next_slot = 0;
             // An MTP slot's group is its current token and the drafts it holds (1 + n_draft rows, n_draft <= the
             // depth; two rows with the default depth 1); rotate slots when the window cannot take them all
             // (batch_depth.hpp: the first slot that does not fit ends the window, none is skipped for a later one).
             int A = 0;
-            int glen[strata::kernels::kVerifyMaxT] = {};
+            int glen[strata::kernels::kVerifyCapT] = {};
             {
                 const size_t nb = bs.size();
                 std::vector<int> nd(nb, 0);
@@ -9465,7 +9465,7 @@ int main(int argc, char **argv) try {
                         bs[b].n_draft, bs[b].p, (int64_t) o.max_context) : 0;
                 }
                 A = strata::core::batch_pack(act.get(), nd.data(), (int) nb, next_slot, batch_mtp,
-                                             strata::kernels::kVerifyMaxT, rows, first, glen, active, &S);
+                                             strata::kernels::verify_max_t(), rows, first, glen, active, &S);
             }
             for (int a = 0; a < A; ++a) {
                 const BSlot& sl = bs[(size_t) active[a]];
@@ -9531,7 +9531,7 @@ int main(int argc, char **argv) try {
             // STRATA_BATCH_MTP_PAIR_HEAD: the slots' drafts are deferred past this loop (their rows copied here) so the
             // two can run as a pair; off, each slot drafts inside the loop exactly as before
             struct PendDraft { int b = 0, t = 0, G = 0, nd = 0; };
-            PendDraft pend[strata::kernels::kVerifyMaxT];
+            PendDraft pend[strata::kernels::kVerifyCapT];
             int n_pend = 0;
             for (int t = 0; t < A; ++t) {
                 const int b = active[t];
@@ -9682,8 +9682,8 @@ int main(int argc, char **argv) try {
         struct PGroup {
             bool inflight = false;
             int stage = 0;                  ///< the stage it runs on or waits for
-            int32_t tok[strata::kernels::kVerifyMaxT] = {};
-            int64_t pos[strata::kernels::kVerifyMaxT] = {};
+            int32_t tok[strata::kernels::kVerifyCapT] = {};
+            int64_t pos[strata::kernels::kVerifyCapT] = {};
             int64_t since = 0;              ///< tick it started waiting (fairness)
         };
         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
