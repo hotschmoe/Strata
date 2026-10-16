@@ -4812,12 +4812,22 @@ int main(int argc, char **argv) try {
                 for (int64_t e = 0; e < g.n_expert; ++e)
                     if (!seen[(size_t) (l * g.n_expert + e)]) ranked[(size_t) l].push_back((int32_t) e);
             std::vector<std::pair<int32_t, int32_t>> set0;
+            // night STRATA_NIGHT_EP_SHARE0=<f>: deal the hottest experts so card 0 (which also runs every dense layer)
+            // takes about fraction f of them instead of half; its quota is unchanged (the coldest fill it)
+            static const double night_share0 = [] {
+                const char* v = std::getenv("STRATA_NIGHT_EP_SHARE0");
+                const double f = v ? std::atof(v) : -1.0;
+                if (f > 0.0 && f < 1.0)
+                    std::fprintf(stderr, "strata night: STRATA_NIGHT_EP_SHARE0=%.3f (card 0's share of the hottest experts)\n", f);
+                return f > 0.0 && f < 1.0 ? f : -1.0;
+            }();
             for (int64_t l = 0; l < g.n_layers; ++l) {
                 int64_t n0 = 0, n1 = 0;
                 const auto& r = ranked[(size_t) l];
                 for (size_t i = 0; i < r.size(); ++i) {
                     const bool pair_odd = ((i / 2) & 1) != 0;
                     int card = ((i & 1) != 0) != pair_odd ? 1 : 0;
+                    if (night_share0 > 0.0) card = (double) (n0 + 1) <= night_share0 * (double) (i + 1) ? 0 : 1;
                     if (card == 0 && n0 >= q0) card = 1;
                     if (card == 1 && n1 >= q1) card = 0;
                     if (card == 0) { set0.push_back({(int32_t) l, r[i]}); ++n0; }
