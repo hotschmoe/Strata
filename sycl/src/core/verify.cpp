@@ -2288,8 +2288,10 @@ bool Verifier::capture_commit(std::string &err) try {
                 gdn_conv_commit(conv, qkv, (int) C, commit_, cs_);
                 gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C, (int) C, gate_L_ + (size_t) gdn_index * MT * HV,
                                     beta_L_ + (size_t) gdn_index * MT * HV, z_, (const float*) wnm->data, EPS, y_dummy_,
-                                    (int) g.ssm_k_heads, (int) HV, (int) MT, commit_, cs_,
-                                    (int) MT);   // S26: t_out_begin = MT - the replay's outputs (y_dummy_) are never read
+                                    (int) g.ssm_k_heads, (int) HV, (int) std::min<int64_t>(MT, strata::kernels::kVerifyMaxT),
+                                    commit_, cs_,
+                                    (int) std::min<int64_t>(MT, strata::kernels::kVerifyMaxT));   // S26: t_out_begin = MT - the replay's outputs (y_dummy_) are never read
+                                    // (night T12: a one-request window keeps <= kVerifyMaxT rows; MT may be 12)
                 ++gdn_index;
             } else {
                 const QsaState& st = ss.qsa_states[qsa_index];
@@ -3173,7 +3175,10 @@ catch (sycl::exception const &exc) {
 // SYCL port: capture every window graph now (one per window size) instead of on first use, so the first request
 // does not pay for them (a 2,400-node graph takes tens of ms to finalize on this backend).
 bool Verifier::warm(std::string &err) {
-    for (int T = 1; T <= max_t_; ++T)
+    // night T12: a batch-MTP verifier's max_t_ can be 12, but a one-request window never exceeds --spec (<= 8):
+    // capture those only (the batch windows capture on first use, capture_batch)
+    const int tmax = std::min<int>((int) max_t_, strata::kernels::kVerifyMaxT);
+    for (int T = 1; T <= tmax; ++T)
         if (!capture(T, err)) return false;
     return true;
 }
