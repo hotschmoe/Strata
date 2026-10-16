@@ -44,6 +44,11 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
                                       const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
                                       std::string& error);
 
+// night-lab STRATA_NIGHT_ADMIT_D2D (generate.cpp's slot admission): conversation_kv_save(from) + conversation_kv_restore(to)
+// as device-to-device queue copies (the same checks, bytes and residency fix-ups); one wait at the end when sync_end.
+bool conversation_kv_copy_device(const QsaState& from, const QsaState& to, const ModelGeometry& g, int64_t upto,
+                                 bool include_index, std::string& error, bool sync_end = true);
+
 struct ConversationStateSizes {
     size_t gdn = 0, ple = 0, tail = 0, dead = 0, block_pos = 0;
 };
@@ -60,6 +65,14 @@ bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const Sess
                                   const ModelGeometry& g, std::string& error);
 bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
                                      const ModelGeometry& g, std::string& error);
+/// night-lab STRATA_NIGHT_ADMIT_D2D: checkpoint_save(ck{ids}, from) + checkpoint_restore(ck, to) as device-to-device
+/// queue copies (the same checks, bytes, pooled row and ple_prev); one wait at the end when sync_end.
+bool conversation_checkpoint_copy_device(const SessionState& from, SessionState& to, const ModelGeometry& g,
+                                         const std::vector<int32_t>& ids, std::string& error, bool sync_end = true);
+/// STRATA_NIGHT_ADMIT_VERIFY: `session` holds what conversation_checkpoint_restore(checkpoint, session) writes
+/// (running state and ple_prev; read back, no state change)
+bool conversation_checkpoint_verify_device(const ConversationCheckpoint& checkpoint, const SessionState& session,
+                                           const ModelGeometry& g, std::string& error);
 
 struct ConversationView {
     const std::vector<int32_t>& ids;

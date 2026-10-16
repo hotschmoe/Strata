@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <limits>
+#include <vector>
 
 namespace strata::core {
 namespace {
@@ -201,6 +203,82 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     ss.ple_prev[0] = tokens >= 2 ? c.ids[tokens - 2] : -1;
     ss.ple_prev[1] = tokens >= 1 ? c.ids[tokens - 1] : -1;
     return sync(error);
+}
+
+// night-lab STRATA_NIGHT_ADMIT_D2D: conversation_checkpoint_save(ck{ids}, from) + conversation_checkpoint_restore(ck, to)
+// without the host round trip. The same checks (save's targets of `from`, restore's validation of the payload against
+// `to`), the same bytes in the same order (GDN rows, PLE history, per owned QSA layer tail / dead / block position and,
+// for a non-empty prefix, the pooled row from the dead row), the same ple_prev; every copy an async queue memcpy on
+// the current device's in-order queue, ONE wait at the end (sync_end; false leaves them queued for the caller).
+bool conversation_checkpoint_copy_device(const SessionState& from, SessionState& to, const ModelGeometry& g,
+                                         const std::vector<int32_t>& ids, std::string& error, bool sync_end) {
+    ConversationStateSizes zf, zt;
+    if (!checkpoint_targets(from, g, ids.size(), zf, error)) return false;          // save
+    if (!checkpoint_targets(to, g, ids.size(), zt, error)) return false;            // restore: validate
+    const size_t lf = owned_qsa(from), lt = owned_qsa(to);
+    const size_t ple_f = from.ple_hist ? zf.ple : 0, ple_t = to.ple_hist ? zt.ple : 0;
+    if (zf.gdn != zt.gdn || ple_f != ple_t || lf * zf.tail != lt * zt.tail || lf * zf.dead != lt * zt.dead ||
+        lf * zf.block_pos != lt * zt.block_pos || lf != lt)
+        return fail(error, "invalid checkpoint running-state payload");
+    try {
+        sycl::queue& q = dpct::get_in_order_queue();
+        auto cp = [&](void* dst, const void* src, size_t bytes) {
+            if (!bytes) return true;
+            if (!dst || !src) return fail(error, "missing running-state buffer");
+            q.memcpy(dst, src, bytes);
+            return true;
+        };
+        if (!cp(to.gdn_state, from.gdn_state, zf.gdn) || !cp(to.ple_hist, from.ple_hist, ple_f)) return false;
+        for (size_t j = 0; j < lf; ++j) {
+            const auto& sf = owned(from, j);
+            const auto& st = owned(to, j);
+            if (!cp(st.idx_tail, sf.idx_tail, zf.tail) || !cp(st.idx_dead, sf.idx_dead, zf.dead) ||
+                !cp(st.idx_block_pos, sf.idx_block_pos, zf.block_pos)) return false;
+            if (!ids.empty()) {
+                const size_t row = ids.size() / strata::kernels::qsa_real_shapes().idx_block;
+                if (!cp(st.idx_pooled + row * g.idx_key_dim, sf.idx_dead, zf.dead)) return false;
+            }
+        }
+    } catch (sycl::exception const& e) {
+        error = std::string("conversation snapshot running-state copy: ") + e.what();
+        return false;
+    }
+    const size_t tokens = ids.size();
+    to.ple_prev[0] = tokens >= 2 ? ids[tokens - 2] : -1;
+    to.ple_prev[1] = tokens >= 1 ? ids[tokens - 1] : -1;
+    return !sync_end || sync(error);
+}
+
+// STRATA_NIGHT_ADMIT_VERIFY: `ss` holds exactly what conversation_checkpoint_restore(c, ss) writes to the GDN rows, the
+// PLE history, the per-layer tail / dead / block position and ple_prev (read back after a sync; no state change)
+bool conversation_checkpoint_verify_device(const ConversationCheckpoint& c, const SessionState& ss,
+                                           const ModelGeometry& g, std::string& error) {
+    if (!conversation_checkpoint_validate(c, ss, g, error) || !sync(error)) return false;
+    ConversationStateSizes z;
+    if (!conversation_session_sizes(g, ss, z, error)) return false;
+    std::vector<uint8_t> buf;
+    auto same = [&](const void* dev, const uint8_t* want, size_t n, const char* what) {
+        if (!n) return true;
+        buf.resize(n);
+        if (!copy(buf.data(), dev, n, error)) return false;
+        if (std::memcmp(buf.data(), want, n) != 0) { error = std::string("admission verify: ") + what + " bytes differ"; return false; }
+        return true;
+    };
+    if (!same(ss.gdn_state, c.gdn.data(), c.gdn.size(), "GDN state") || !same(ss.ple_hist, c.ple.data(), c.ple.size(), "PLE history"))
+        return false;
+    for (size_t j = 0; j < owned_qsa(ss); ++j) {
+        const auto& st = owned(ss, j);
+        if (!same(st.idx_tail, c.tails.data() + j * z.tail, z.tail, "indexer tail") ||
+            !same(st.idx_dead, c.dead.data() + j * z.dead, z.dead, "indexer dead row") ||
+            !same(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos, "indexer block position"))
+            return false;
+    }
+    const size_t tokens = c.ids.size();
+    if (ss.ple_prev[0] != (tokens >= 2 ? c.ids[tokens - 2] : -1) || ss.ple_prev[1] != (tokens >= 1 ? c.ids[tokens - 1] : -1)) {
+        error = "admission verify: ple_prev differs";
+        return false;
+    }
+    return true;
 }
 
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& ss,

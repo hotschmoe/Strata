@@ -36,12 +36,14 @@ struct Fixture {
     ModelGeometry g;
     QsaState state;
     std::vector<void*> device, host;
+    std::vector<std::pair<void*,size_t>> all;   // night: every allocation, for byte comparisons of two fixtures
     std::array<void*,5> sources{};
     std::array<size_t,5> sizes{};
 
     template<class T> void alloc(T*& p, size_t n, bool pinned = false) {
         if (!n) return;
         void* raw = nullptr;
+        struct Rec { std::vector<std::pair<void*,size_t>>& v; T*& p; size_t n; ~Rec() { if (p) v.emplace_back((void*) p, n); } } rec{all, p, n};
         if (pinned) {
             /*
             DPCT1048: The original value cudaHostAllocMapped is not
@@ -310,6 +312,76 @@ void full_session(int fmt, int mode, int experts) {
     check(spare==a.checkpoints[0].dead,"checkpoint rebuilds spare row over a later completed block");
     check(ss.ple_prev[0]==2 && ss.ple_prev[1]==3,"checkpoint PLE token window");
 }
+
+// night-lab STRATA_NIGHT_ADMIT_D2D: the device-to-device copies leave the target byte-for-byte as the save + restore
+// pairs do. Fixtures B (D2D) and C (old path) start identical (every allocation filled the same way), A is the source.
+std::vector<uint8_t> read_all(const Fixture& f) {
+    std::vector<uint8_t> out;
+    for (const auto& [p, n] : f.all) {
+        const size_t at = out.size();
+        out.resize(at + n);
+        dpct::get_in_order_queue().memcpy(out.data() + at, p, n).wait();
+    }
+    return out;
+}
+void fill_all(Fixture& f, uint8_t salt) {
+    for (const auto& [p, n] : f.all) {
+        std::vector<uint8_t> data(n);
+        for (size_t j = 0; j < n; ++j) data[j] = (uint8_t) (salt + j * 13 + j / 509);
+        dpct::get_in_order_queue().memcpy(p, data.data(), n).wait();
+    }
+}
+void d2d_admission(int fmt, int mode) {
+    Fixture A(fmt, mode), B(fmt, mode), C(fmt, mode);
+    for (Fixture* f : {&A, &B, &C}) { f->g.n_layers = 4; f->g.ssm_state_size = 2; f->g.ssm_v_heads = 2; f->g.ssm_conv_channels = 8; }
+    const ModelGeometry& g = A.g;
+    std::string err;
+    ConversationStateSizes sizes;
+    check(conversation_state_sizes(g, sizes, err), "d2d: geometry sizes");
+    SessionState sa, sb, sc;
+    Fixture* fx[3] = {&A, &B, &C};
+    SessionState* ss[3] = {&sa, &sb, &sc};
+    for (int i = 0; i < 3; ++i) {
+        SessionState& s1 = *ss[i];
+        Fixture& f = *fx[i];
+        s1.max_cells = 96; s1.qsa_states = &f.state;
+        s1.layer_hi = g.n_layers; s1.gdn_alloc = g.n_gdn_layers(); s1.qsa_alloc = g.n_qsa_layers();
+        f.alloc(s1.gdn_state, sizes.gdn); f.alloc(s1.ple_hist, sizes.ple);
+        f.alloc(f.state.idx_tail, sizes.tail); f.alloc(f.state.idx_dead, sizes.dead);
+        f.alloc(f.state.idx_block_pos, sizes.block_pos);
+    }
+    for (int64_t upto : {0, 1, 3, 4, 5, 63, 64, 65, 96}) {
+        const bool index = mode != 2;
+        fill_all(A, 41); fill_all(B, 7); fill_all(C, 7);
+        cuda_check(DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()));
+        std::vector<int32_t> ids((size_t) upto);
+        for (size_t i = 0; i < ids.size(); ++i) ids[i] = (int32_t) (3 * i + 1);
+        // old path into C (generate.cpp copy_to_slot's order: running state, then the K/V)
+        if (mode != 2) {   // a draft ring layer has no session running state
+            ConversationCheckpoint ck;
+            ck.ids = ids;
+            check(conversation_checkpoint_save(ck, sa, g, err) && conversation_checkpoint_restore(ck, sc, g, err), "d2d: old checkpoint pair");
+        }
+        ConversationKv img;
+        check(conversation_kv_save(img, A.state, g, upto, index, err), "d2d: old kv save");
+        cuda_check(DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()));
+        check(conversation_kv_restore(img, C.state, g, upto, index, err), "d2d: old kv restore");
+        // D2D into B
+        if (mode != 2) check(conversation_checkpoint_copy_device(sa, sb, g, ids, err, false), "d2d: checkpoint copy");
+        check(conversation_kv_copy_device(A.state, B.state, g, upto, index, err, true), "d2d: kv copy");
+        cuda_check(DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()));
+        check(read_all(B) == read_all(C), "d2d: target bytes equal the save + restore pair (every allocation)");
+        check(sb.ple_prev[0] == sc.ple_prev[0] && sb.ple_prev[1] == sc.ple_prev[1], "d2d: ple_prev");
+        if (mode != 2) {
+            ConversationCheckpoint ck;
+            ck.ids = ids;
+            check(conversation_checkpoint_save(ck, sa, g, err) && conversation_checkpoint_verify_device(ck, sb, g, err),
+                  "d2d: checkpoint verify helper agrees");
+        }
+        uint64_t fp = 0;
+        check(conversation_kv_verify(img, B.state, g, upto, index, fp, err), "d2d: kv verify (authoritative + ring)");
+    }
+}
 }
 
 int main() {
@@ -428,5 +500,10 @@ int main() {
     for (int fmt : {kKvF16,kKvInt8,kKvQ4}) for (int mode : {0,1}) for (int experts : {256,512})
         full_session(fmt,mode,experts);
     for (int experts : {256,512}) full_session(3,0,experts);
+    for (int fmt : std::array<int,4>{kKvF16,kKvInt8,kKvQ4,3}) for (int mode : {0,1,2}) {
+        if (fmt==3 && mode!=0) continue;
+        d2d_admission(fmt,mode);
+    }
+    std::printf("conversation_snapshot_test: night D2D admission copies byte-identical to save + restore (all formats/modes)\n");
     std::printf("conversation_snapshot_test: %d checks passed\n",checks);
 }

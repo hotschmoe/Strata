@@ -9157,6 +9157,65 @@ int main(int argc, char **argv) try {
             in_lines.pop_front();
             return true;
         };
+        // night-lab STRATA_NIGHT_ADMIT_D2D=1: the slot copies below as device-to-device queue copies (the same
+        // checks and bytes as each save + restore pair, one wait per stage) instead of a host round trip with a
+        // device sync per piece; STRATA_NIGHT_ADMIT_VERIFY=1 also runs the old saves and compares every region the old
+        // restores would write (and the draft ring) against the slot, once per copy, and logs the result
+        static const bool night_d2d = [] {
+            const char* v = std::getenv("STRATA_NIGHT_ADMIT_D2D");
+            const bool on = v != nullptr && v[0] == '1';
+            if (on) std::fprintf(stderr, "strata: STRATA_NIGHT_ADMIT_D2D=1: batch slot copies device to device\n");
+            return on;
+        }();
+        static const bool night_verify = [] { const char* v = std::getenv("STRATA_NIGHT_ADMIT_VERIFY"); return v != nullptr && v[0] == '1'; }();
+        double night_park_ms = 0.0, night_copy_ms = 0.0;
+        // the D2D copy of one stage's sessions (running state + every owned QSA layer's K/V) and, with
+        // STRATA_NIGHT_ADMIT_VERIFY, the comparison with what the old save + restore pairs write
+        auto night_stage_copy = [&](strata::core::SessionState& from, strata::core::SessionState& to,
+                                    const std::vector<int32_t>& ck_ids, bool with_checkpoint, int64_t upto,
+                                    std::string& e) -> bool {
+            if (with_checkpoint && !strata::core::conversation_checkpoint_copy_device(from, to, g, ck_ids, e, false)) return false;
+            for (int64_t j = 0; j < from.qsa_alloc; ++j)
+                if (!strata::core::conversation_kv_copy_device(from.qsa_states[from.qsa_ord0 + j], to.qsa_states[to.qsa_ord0 + j],
+                                                               g, upto, true, e, false))
+                    return false;
+            if (DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()) != 0) {
+                e = "batch slot copy: device sync failed"; return false;
+            }
+            if (!night_verify) return true;
+            std::string why;
+            bool ok = true;
+            if (with_checkpoint) {
+                strata::core::ConversationCheckpoint ck;
+                ck.ids = ck_ids;
+                ok = strata::core::conversation_checkpoint_save(ck, from, g, why) &&
+                     strata::core::conversation_checkpoint_verify_device(ck, to, g, why);
+            }
+            for (int64_t j = 0; ok && j < from.qsa_alloc; ++j) {
+                strata::core::ConversationKv img;
+                uint64_t fp = 0;
+                ok = strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, why) &&
+                     strata::core::conversation_kv_verify(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, fp, why);
+            }
+            std::fprintf(stderr, "strata: STRATA_NIGHT_ADMIT_VERIFY: stage copy of %lld tokens (%lld QSA layers%s): %s%s\n",
+                         (long long) upto, (long long) from.qsa_alloc, with_checkpoint ? " + running state" : "",
+                         ok ? "PASS" : "FAIL: ", ok ? "" : why.c_str());
+            return true;
+        };
+        auto night_draft_copy = [&](const strata::core::QsaState& from, const strata::core::QsaState& to, int64_t upto,
+                                    std::string& e) -> bool {
+            if (!strata::core::conversation_kv_copy_device(from, to, draft_geometry, upto, false, e, true)) return false;
+            if (night_verify) {
+                std::string why;
+                strata::core::ConversationKv img;
+                uint64_t fp = 0;
+                const bool ok = strata::core::conversation_kv_save(img, from, draft_geometry, upto, false, why) &&
+                                strata::core::conversation_kv_verify(img, to, draft_geometry, upto, false, fp, why);
+                std::fprintf(stderr, "strata: STRATA_NIGHT_ADMIT_VERIFY: draft K/V copy of %lld tokens: %s%s\n",
+                             (long long) upto, ok ? "PASS" : "FAIL: ", ok ? "" : why.c_str());
+            }
+            return true;
+        };
         // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
         auto copy_to_slot = [&](int b, const std::vector<int32_t> &ids,
                                 std::string &e) -> bool {
@@ -9170,6 +9229,10 @@ int main(int argc, char **argv) try {
                         dpct::get_current_device().queues_wait_and_throw()) !=
                     0) {
                     e = "batch admission: device sync failed"; return false;
+                }
+                if (night_d2d) {
+                    if (!night_stage_copy(from, to, ids, true, upto, e)) return false;
+                    continue;
                 }
                 strata::core::ConversationCheckpoint ck;
                 ck.ids = ids;
@@ -9196,6 +9259,11 @@ int main(int argc, char **argv) try {
             if (batch_mtp) {
                 // Admission first builds the solo draft KV; copy it into the slot before drafting.
                 strata::core::ConversationKv image;
+                if (night_d2d) {
+                    if (!mtp.idle(e) || !slot_mtp[(size_t)b]->idle(e) ||
+                        !night_draft_copy(mtp.kv_state(), slot_mtp[(size_t)b]->kv_state(), upto, e))
+                        return false;
+                } else
                 if (!mtp.idle(e) || !slot_mtp[(size_t)b]->idle(e) ||
                     !strata::core::conversation_kv_save(image, mtp.kv_state(),
                                                         draft_geometry, upto,
@@ -9235,6 +9303,13 @@ int main(int argc, char **argv) try {
                     0) {
                     e = "batch slot restore: device sync failed"; return false;
                 }
+                if (night_d2d) {   // a checkpoint's running state still comes from its host copy; the rest D2D
+                    if (at != nullptr &&
+                        !strata::core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, g, e))
+                        return false;
+                    if (!night_stage_copy(from, to, bs[(size_t) b].ids, at == nullptr, upto, e)) return false;
+                    continue;
+                }
                 if (at != nullptr) {
                     if (!strata::core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, g, e))
                         return false;
@@ -9266,6 +9341,11 @@ int main(int argc, char **argv) try {
             if (batch_mtp) {
                 // A returning solo request resumes from its slot's draft KV.
                 strata::core::ConversationKv image;
+                if (night_d2d) {
+                    if (!slot_mtp[(size_t)b]->idle(e) || !mtp.idle(e) ||
+                        !night_draft_copy(slot_mtp[(size_t)b]->kv_state(), mtp.kv_state(), upto, e))
+                        return false;
+                } else
                 if (!slot_mtp[(size_t)b]->idle(e) || !mtp.idle(e) ||
                     !strata::core::conversation_kv_save(
                         image, slot_mtp[(size_t)b]->kv_state(), draft_geometry,
@@ -10874,7 +10954,12 @@ int main(int argc, char **argv) try {
                             e = err;
                             return false;
                         }
+                        const auto ty1 = Clock::now();
                         if (can && copy_to_slot(ys, pre, ye)) {
+                            if (night_d2d)
+                                std::fprintf(stderr, "strata batch: yield copy: park %.1f ms, copy %.1f ms\n",
+                                             std::chrono::duration<double, std::milli>(ty1 - ty).count(),
+                                             std::chrono::duration<double, std::milli>(Clock::now() - ty1).count());
                             BSlot& sl = bs[(size_t) ys];
                             sl = BSlot{};
                             sl.ids = std::move(pre);
@@ -12156,11 +12241,16 @@ int main(int argc, char **argv) try {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                const auto tc1 = Clock::now();
+                night_park_ms = std::chrono::duration<double, std::milli>(tc1 - tc0).count();
+                night_copy_ms = 0.0;
+                double night_draft_ms = 0.0;
                 if (cont && !copy_to_slot(admit_slot, live, err)) {
                     std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
                     cont = false;
                 }
+                night_copy_ms = std::chrono::duration<double, std::milli>(Clock::now() - tc1).count();
                 if (cont) {
                     ver.set_slot_sampling(admit_slot, req_sp);   // the request's own sampling, row by row
                     BSlot& sl = bs[(size_t) admit_slot];
@@ -12172,6 +12262,7 @@ int main(int argc, char **argv) try {
                     sl.max_new = admit_max_new;
                     sl.t0 = Clock::now();
                     sl.ids = live;
+                    const auto tc2 = Clock::now();
                     if (batch_mtp) {
                         int nd = 0;
                         if (!slot_mtp[(size_t) admit_slot]->draft_first(1, ver.final_R_all(), sl.x,
@@ -12184,6 +12275,7 @@ int main(int argc, char **argv) try {
                         sl.n_draft = nd < 0 ? 0 : nd > batch_depth ? batch_depth : nd;
                         sl.draft_ready = true;
                     }
+                    night_draft_ms = std::chrono::duration<double, std::milli>(Clock::now() - tc2).count();
                     sl.cvec = cvec_cached;
                     sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
                     const ConvCheckpoint* best = nullptr;
@@ -12192,6 +12284,12 @@ int main(int argc, char **argv) try {
                             std::equal(c.ids.begin(), c.ids.end(), live.begin()))
                             best = &c;
                     if (best != nullptr && !sl.img) sl.checks.push_back(*best);
+                    if (night_d2d)
+                        std::fprintf(stderr, "strata batch: slot %d takes %lld tokens (copied in %.1f ms: park %.1f, copy %.1f, "
+                                             "draft_first %.1f ms)\n", admit_slot, (long long) live.size(),
+                                     std::chrono::duration<double, std::milli>(Clock::now() - tc0).count(), night_park_ms,
+                                     night_copy_ms, night_draft_ms);
+                    else
                     std::fprintf(stderr, "strata batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
                                  (long long) live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
                 }

@@ -250,6 +250,48 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     return false;
 }
 
+// night-lab STRATA_NIGHT_ADMIT_D2D: conversation_kv_save(image, from, upto, index) + conversation_kv_restore(image, to)
+// without the host round trip: save's layout / validity of `from`, restore's validation of that image against `to`
+// (format, cells, geometry, part sizes, target pools), the five parts' bytes [0, size) from pools(from) to pools(to),
+// then restore's residency fix-ups of `to` (kv_mode 1: the streaming map reset; kv_mode 2: the ring refill), all on
+// the current device's in-order queue; ONE wait at the end when sync_end.
+bool conversation_kv_copy_device(const QsaState& from, const QsaState& to, const ModelGeometry& g, int64_t upto,
+                                 bool index, std::string& error, bool sync_end) try {
+    Layout lf{}, lt{};
+    if (!layout(from, g, upto, index, lf, error) || !valid(from, lf, upto, error)) return false;   // save
+    if (!layout(to, g, upto, index, lt, error) || !valid(to, lt, upto, error)) return false;       // restore
+    if (lf.format != lt.format || lf.cells != lt.cells || lf.page_size != lt.page_size || lf.pooled_rows != lt.pooled_rows) {
+        error = "conversation snapshot: incompatible K/V geometry";
+        return false;
+    }
+    const std::array<size_t,5> sf = {lf.data, lf.value_data, lf.scales, lf.value_scales, lf.pooled};
+    const std::array<size_t,5> st = {lt.data, lt.value_data, lt.scales, lt.value_scales, lt.pooled};
+    if (sf != st) { error = "conversation snapshot: invalid K/V payload size"; return false; }
+    const auto src = pools(from);
+    const auto dst = pools(to);
+    for (size_t i = 0; i < 5; ++i)
+        if (sf[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
+    sycl::queue& q = dpct::get_in_order_queue();
+    for (size_t i = 0; i < 5; ++i) {
+        if (!sf[i]) continue;
+        if (!src[i]) { error = "conversation snapshot: missing state buffer"; return false; }
+        q.memcpy(dst[i], src[i], sf[i]);
+    }
+    if (to.kv_mode == 1) strata::kernels::kv_stream_reset(to.map, nullptr);
+    if (to.kv_mode == 2 && upto > 0) {
+        auto shapes = strata::kernels::qsa_real_shapes();
+        shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
+        const int64_t end = (upto + shapes.page_size - 1) / shapes.page_size;
+        strata::kernels::kv_ring_restore(qsa_attn_pools(to), to.host, qsa_kv_format(to),
+                                        std::max<int64_t>(0, end - to.n_slots), end, to.n_slots, shapes, nullptr);
+    }
+    if (sync_end) q.wait_and_throw();
+    return true;
+} catch (sycl::exception const& e) {
+    error = std::string("conversation snapshot device copy: ") + e.what();
+    return false;
+}
+
 bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
                                 std::array<uint64_t, 5>& sizes, std::string& error) {
     Layout l{};
