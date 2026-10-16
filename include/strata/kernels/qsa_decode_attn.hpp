@@ -43,4 +43,23 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
 
+/// Night-lab (STRATA_NIGHT_ATTN_BATCH): the batched form over SEVERAL KV pool sets in one launch - a C2 verify window's
+/// rows belong to different slot sessions, each with its own pools.  Rows [sum(rows[0..k)), +rows[k]) read pools[k];
+/// q / ids / steps / scratch / attn are row-contiguous exactly as for qsa_decode_attn_batch, and every row's arithmetic
+/// is that call's (the work-group of query z reads pools[slot(z)] and nothing else differs): bitwise the per-slot calls.
+/// At most kQsaAttnMaxPools pool sets, all of one KV format; otherwise it falls back to one call per pool set.
+inline constexpr int kQsaAttnMaxPools = 4;
+void qsa_decode_attn_multi(const float* q, const QsaAttnPools* pools, const int* rows, int n_pools, const int32_t* ids,
+                           const int32_t* steps, int64_t cap, const QsaShapes& s, float* scratch, float* attn,
+                           void* stream);
+
+/// Night-lab switches (latched from the environment, one stderr line when on):
+///   STRATA_NIGHT_ATTN_MERGE_ACTIVE=1 - the merge folds only the chunks the row's selection reaches (ceil(width/64)),
+///                                      their loads issued 8 at a time in the same fold order;
+///                                      the chunks past it hold m = -FLT_MAX, which both merge loops skip: bitwise.
+///   STRATA_NIGHT_ATTN_VPIPE=1        - decode calls (n_q <= 8) use the S93 value-pipelined chunk kernel (four V loads
+///                                      in flight, cells folded in the same ascending order): bitwise.
+bool qsa_night_merge_active();
+bool qsa_night_vpipe();
+
 }  // namespace strata::kernels

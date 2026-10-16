@@ -363,6 +363,10 @@ if(STRATA_SYCL_PARITY)
   strata_resolve(_src src/kernels/qsa_prompt_attn_parity.cpp)
   add_executable(qsa_prompt_attn_parity ${_src})
   target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels)
+  # night-lab STRATA_NIGHT_ATTN_BATCH: verify-window QSA select/attention per row vs per slot vs one launch (bitwise + timing)
+  strata_resolve(_src src/kernels/qsa_verify_batch_parity.cpp)
+  add_executable(qsa_verify_batch_parity ${_src})
+  target_link_libraries(qsa_verify_batch_parity PRIVATE strata_kernels)
   # the hybrid K8V4 KV test (upstream 0.1.27) passes its appends, gathers and attention here and fails only its
   # last step, the same tensor-core prompt kernel. Built, not registered, until that kernel is ported.
   strata_resolve(_src src/kernels/kv_hybrid_parity.cpp)

@@ -16,6 +16,8 @@
 #include <cstring>
 
 namespace strata::kernels {
+class block_topk_wide_scan_night;   // night-lab kernel name (namespace scope: globally visible)
+template <int NQ> class block_scores_t_night;
 namespace {
 
 constexpr int IDX_DIM = 128, IDX_HEADS = 4, R = 4;
@@ -881,6 +883,7 @@ block_topk_wide_kernel exceeds 128 bytes and may cause high register pressure.
 Consult with your hardware vendor to find the total register size available and
 adjust the code, or use smaller sub-group size to avoid high register pressure.
 */
+template <bool SCAN = false>
 __dpct_inline__ void block_topk_wide_kernel(const float *__restrict__ scores,
                                             const int32_t *__restrict__ steps,
                                             int64_t max_blocks, int64_t cap,
@@ -954,6 +957,21 @@ auto &hist =
         better performance if there is no access to global memory.
         */
         item_ct1.barrier();
+        if constexpr (SCAN) {
+            // night-lab STRATA_NIGHT_TOPK_SCAN: the digit search below as one work-group scan instead of thread 0
+            // walking 256 bins.  S(t) = cells in digits >= t is non-increasing, so above + S(t) >= width holds on
+            // t = 1..d for exactly the d the serial loop stops at (0 when it holds nowhere), and the cells above the
+            // threshold digit are above + S(d + 1).  Integers only: the same digit and count.
+            const int i = t;                                   // scan slot i holds digit 255 - i
+            const int v = i < 256 ? hist[0][255 - i] : 0;
+            const int Q = sycl::inclusive_scan_over_group(item_ct1.get_group(), v, sycl::plus<int>());   // S(255 - i)
+            const int pr = (i < 255 && (int64_t) above + Q >= width) ? 1 : 0;
+            const int d = sycl::reduce_over_group(item_ct1.get_group(), pr, sycl::plus<int>());
+            if (d <= 254 ? i == 254 - d : i == 0) {
+                s_digit = d;
+                s_above = d <= 254 ? above + Q : above;
+            }
+        } else
         if (t == 0) {
             int cum = above, d = 255;
 #pragma unroll
@@ -1204,6 +1222,109 @@ auto &qs = *sycl::ext::oneapi::group_local_memory_for_overwrite<
             if (lane == 0) {
                 if (b == n_bid && s_nkv[qi] % R != 0) score += 1e9f;
                 out[qi * max_blocks + b] = score;
+            }
+        }
+    }
+}
+
+// Night-lab STRATA_NIGHT_QSA_SCORES_T=1: block_scores_multi_kernel (early-exit staging) with the NQ x 4 (query, head)
+// warp reductions of a block done together by a transposed butterfly: at offset o each lane keeps half of its values
+// and adds the partner's copy of that half (one shuffle per value kept), so 4*NQ reductions cost ~16-31 shuffles
+// instead of 20*NQ.  Every reduction combines the same lane sets in the same tree as the butterfly (stage o pairs lane
+// l with l ^ o; only the operand order of each addition differs, and IEEE addition is commutative), each lane's
+// partial is the same expression, and the head sum is 0 + relu(h0) + relu(h1) + relu(h2) + relu(h3) in that order:
+// the same bits.
+template <int m, class SG>
+__dpct_inline__ void scores_t_halve(float* v, int lane, int o, const SG& sg) {
+    const bool up = (lane & o) != 0;
+#pragma unroll
+    for (int j = 0; j < m / 2; ++j) {
+        const float send = up ? v[j] : v[j + m / 2];
+        const float keep = up ? v[j + m / 2] : v[j];
+        const float recv = sycl::permute_group_by_xor(sg, send, o);
+        v[j] = keep + recv;
+    }
+}
+template <int NQ>
+__dpct_inline__ void block_scores_multi_t_kernel(
+    const float *__restrict__ pooled, const float *__restrict__ dead,
+    const float *__restrict__ q_idx, const int32_t *__restrict__ steps,
+    int64_t max_blocks, float *__restrict__ out) {
+    constexpr int C = NQ * IDX_HEADS;
+    constexpr int M = C <= 4 ? 4 : (C <= 8 ? 8 : (C <= 16 ? 16 : 32));   // values per lane, a power of two
+    constexpr int P = M == 4 ? 2 : (M == 8 ? 3 : (M == 16 ? 4 : 5));      // halving stages
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    auto &qs = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        float[MQ * IDX_HEADS * IDX_DIM]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &s_nkv =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<int64_t[MQ]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &s_nbid =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<int64_t[MQ]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    if (item_ct1.get_local_id(2) < (size_t) NQ) {
+        s_nkv[item_ct1.get_local_id(2)] =
+            steps[item_ct1.get_local_id(2) * kStepCount + kStepNKv];
+        s_nbid[item_ct1.get_local_id(2)] =
+            steps[item_ct1.get_local_id(2) * kStepCount + kStepNBid];
+    }
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    int64_t top = 0;
+    for (int q = 0; q < NQ; ++q) top = s_nbid[q] > top ? s_nbid[q] : top;
+    if ((int64_t)item_ct1.get_group(2) * SCORE_WARPS > top) return;
+    for (int i = item_ct1.get_local_id(2); i < NQ * IDX_HEADS * IDX_DIM;
+         i += item_ct1.get_local_range(2)) qs[i] = q_idx[i];
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    const int lane = item_ct1.get_local_id(2) & 31;
+    const int64_t wstride = (int64_t)item_ct1.get_group_range(2) * SCORE_WARPS;
+    for (int64_t b = (int64_t)item_ct1.get_group(2) * SCORE_WARPS +
+                     (item_ct1.get_local_id(2) >> 5);
+         b <= top && b < max_blocks; b += wstride) {
+        const sycl::float4 kp = *reinterpret_cast<const sycl::float4 *>(
+            pooled + b * IDX_DIM + lane * 4);
+        const sycl::float4 kd =
+            *reinterpret_cast<const sycl::float4 *>(dead + lane * 4);
+        float v[M];
+#pragma unroll
+        for (int qi = 0; qi < NQ; ++qi) {
+            const sycl::float4 k4 = (b == s_nbid[qi]) ? kd : kp;
+            const float* q = qs + qi * IDX_HEADS * IDX_DIM + lane * 4;
+#pragma unroll
+            for (int h = 0; h < IDX_HEADS; ++h) {
+                const sycl::float4 q4 =
+                    *reinterpret_cast<const sycl::float4 *>(q + h * IDX_DIM);
+                float d = k4.x() * q4.x() + k4.y() * q4.y() + k4.z() * q4.z() +
+                          k4.w() * q4.w();
+                v[qi * IDX_HEADS + h] = d;
+            }
+        }
+#pragma unroll
+        for (int c = C; c < M; ++c) v[c] = 0.0f;
+        // P halving stages (o = 16, 8, ...): a lane with bit o clear keeps the lower half of its values
+        scores_t_halve<M>(v, lane, 16, sg);
+        if constexpr (P >= 2) scores_t_halve<M / 2>(v, lane, 8, sg);
+        if constexpr (P >= 3) scores_t_halve<M / 4>(v, lane, 4, sg);
+        if constexpr (P >= 4) scores_t_halve<M / 8>(v, lane, 2, sg);
+        if constexpr (P >= 5) scores_t_halve<M / 16>(v, lane, 1, sg);
+        // the remaining stages: a plain butterfly on the one value left (combo lane >> (5 - P))
+        float r = v[0];
+#pragma unroll
+        for (int o = 16 >> P; o > 0; o >>= 1) r += sycl::permute_group_by_xor(sg, r, o);
+        // lane qi < NQ gathers its query's four heads (combo 4 qi + h sits on lane (4 qi + h) << (5 - P))
+        const int qi = lane < NQ ? lane : 0;
+        float score = 0.0f;
+#pragma unroll
+        for (int h = 0; h < IDX_HEADS; ++h) {
+            const float d = sycl::select_from_group(sg, r, (unsigned) ((qi * IDX_HEADS + h) << (5 - P)));
+            score += d > 0.0f ? d : 0.0f;
+        }
+        if (lane < NQ) {
+            const int64_t n_bid = s_nbid[lane];
+            if (b <= n_bid) {
+                if (b == n_bid && s_nkv[lane] % R != 0) score += 1e9f;
+                out[lane * max_blocks + b] = score;
             }
         }
     }
@@ -1602,6 +1723,36 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
     if (multi && nq <= MQ && active_blocks <= 0) {   // no active count: decode (captured or not) and prefill's pooled16
         // STRATA_QSA_EARLY_EXIT=0 keeps the old staging (every CTA loads the queries first); the scores are the same bits
         static const bool early = [] { const char* v = std::getenv("STRATA_QSA_EARLY_EXIT"); return v == nullptr || std::atoi(v) != 0; }();
+        static const bool night_t = [] {
+            const char* v = std::getenv("STRATA_NIGHT_QSA_SCORES_T");
+            const bool on = v != nullptr && v[0] == '1' && v[1] == '\0';
+            if (on) std::fprintf(stderr, "strata night: STRATA_NIGHT_QSA_SCORES_T=1 (decode QSA block scores, transposed warp reductions, bitwise)\n");
+            return on;
+        }();
+        if (night_t && early) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            const sycl::nd_range<3> r(sycl::range(1, 1, 256) * sycl::range(1, 1, SCORE_WARPS * 32),
+                                      sycl::range(1, 1, SCORE_WARPS * 32));
+            sycl::queue* qq = strata::q_of(stream);
+#define STRATA_NIGHT_SCORES_T(NQ_)                                                                                  \
+            qq->parallel_for<block_scores_t_night<NQ_>>(r, exp_props,                                              \
+                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {                                 \
+                    block_scores_multi_t_kernel<NQ_>(pooled, dead, q_idx, steps, max_blocks, scores);              \
+                });
+            switch (nq) {
+                case 1: STRATA_NIGHT_SCORES_T(1) break;
+                case 2: STRATA_NIGHT_SCORES_T(2) break;
+                case 3: STRATA_NIGHT_SCORES_T(3) break;
+                case 4: STRATA_NIGHT_SCORES_T(4) break;
+                case 5: STRATA_NIGHT_SCORES_T(5) break;
+                case 6: STRATA_NIGHT_SCORES_T(6) break;
+                case 7: STRATA_NIGHT_SCORES_T(7) break;
+                default: STRATA_NIGHT_SCORES_T(8) break;
+            }
+#undef STRATA_NIGHT_SCORES_T
+            return;
+        }
         {
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
@@ -2035,6 +2186,23 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
         const char* v = std::getenv("STRATA_TOPK_STREAM");
         return v == nullptr || v[0] != '0';
     }();
+    static const bool night_scan = [] {
+        const char* v = std::getenv("STRATA_NIGHT_TOPK_SCAN");
+        const bool on = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (on) std::fprintf(stderr, "strata night: STRATA_NIGHT_TOPK_SCAN=1 (QSA wide top-k digit search as a work-group scan, same ids)\n");
+        return on;
+    }();
+    if (night_scan && (reach > fit || (turing_wide && counted && reach > 22528))) {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        strata::q_of(stream)->parallel_for<block_topk_wide_scan_night>(
+            sycl::nd_range<3>(sycl::range(1, 1, (unsigned)nq) * sycl::range(1, 1, TK_T), sycl::range(1, 1, TK_T)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                block_topk_wide_kernel<true>(scores, steps, max_blocks, cap, ids);
+            });
+        return;
+    }
     if (reach > fit || (turing_wide && counted && reach > 22528))   // past the register kernel's reach, or Turing's band
         /*
         DPCT1049: The work-group size passed to the SYCL kernel may exceed

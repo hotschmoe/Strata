@@ -122,6 +122,19 @@ bool env_on(const char* name) {
 // S143: process-constant before capture; only privately checked three-row groups.
 const bool g_qsa_commit_group_steps = env_on("STRATA_QSA_COMMIT_GROUP_STEPS");
 const bool g_gdn_commit_layers = env_on("STRATA_GDN_COMMIT_LAYERS");
+// Night-lab STRATA_NIGHT_ATTN_BATCH (default 0): a batch (C2) verify window's QSA attention per slot instead of per row.
+//   1    the rows of a slot share one scores / K/V-append / indexer-append launch, and the whole window one top-k, one
+//        chunk (one launch over every slot's pools) and one merge: 24 -> 5 select/attention launches per layer at C2
+//   slot the per-slot form of everything (scores, top-k, chunk+merge per slot): 24 -> 8
+// Every row's arithmetic is the per-row call's (each kernel's per-query work is independent of its batch): bitwise.
+const int g_night_attn_batch = [] {
+    const char* e = std::getenv("STRATA_NIGHT_ATTN_BATCH");
+    int m = 0;
+    if (e != nullptr && e[0] != 0 && e[0] != '0') m = std::strcmp(e, "slot") == 0 ? 2 : 1;
+    if (m) std::fprintf(stderr, "strata night: STRATA_NIGHT_ATTN_BATCH=%s (batch verify QSA attention per slot%s, bitwise)\n",
+                        e, m == 1 ? ", one top-k/chunk/merge launch per window" : "");
+    return m;
+}();
 #if defined(STRATA_USE_HIP)
 const bool g_coherent = env_on("STRATA_VERIFY_COHERENT");
 const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");
@@ -1179,6 +1192,38 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                         for (int t = tb; t < te; ++t)
                             kv_append_step(st.k_pool, st.v_pool, st.page_table, step_ + t * kStepCount,
                                            kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
+                } else if (batch_rec_ && g_night_attn_batch && dec_batch && !g_no_batch_kv) {
+                    // night: a slot's contiguous rows in one launch - kv_append_q8_steps / q4_steps are the single-cell
+                    // kernels per token (kv_steps_parity); K8V4 and FP16 pools keep the row loop
+                    for (int t = tb; t < te;) {
+                        const int first = t;
+                        while (t < te && brow_[t] == brow_[first]) ++t;
+                        const int cnt = t - first;
+                        const QsaState& sx = slot_ss(first).qsa_states[qi];
+                        const int32_t* step_f = step_ + first * kStepCount;
+                        const float* kc_f = kcur_ + first * NKV * HD;
+                        const float* vc_f = vcur_ + first * NKV * HD;
+                        if (!sx.kv_hybrid && sx.kv_q4)
+                            kv_append_q4_steps(sx.k_q4, sx.v_q4, sx.page_table, step_f, kStepCount, cnt, kc_f, vc_f, s, cs,
+                                               &sx.host);
+                        else if (!sx.kv_hybrid && sx.kv_int8)
+                            kv_append_q8_steps(sx.k_q, sx.v_q, sx.k_scale, sx.v_scale, sx.page_table, step_f, kStepCount,
+                                               kc_f, vc_f, (int) (NKV * HD), cnt, s, cs, &sx.host);
+                        else
+                            for (int u = first; u < t; ++u) {
+                                const int32_t* step_u = step_ + u * kStepCount;
+                                if (sx.kv_hybrid) {
+                                    const KvHostPools hk = kv_hybrid_k_half(sx.host), hv = kv_hybrid_v_half(sx.host);
+                                    const bool mirror = sx.host.present();
+                                    kv_append_q8_step(sx.k_q, sx.k_q, sx.k_scale, sx.k_scale, sx.page_table, step_u,
+                                                      kcur_ + u * NKV * HD, kcur_ + u * NKV * HD, s, cs, mirror ? &hk : nullptr);
+                                    kv_append_q4_step(sx.v_q4, sx.v_q4, sx.page_table, step_u, vcur_ + u * NKV * HD,
+                                                      vcur_ + u * NKV * HD, s, cs, mirror ? &hv : nullptr);
+                                } else
+                                    kv_append_step(sx.k_pool, sx.v_pool, sx.page_table, step_u, kcur_ + u * NKV * HD,
+                                                   vcur_ + u * NKV * HD, s, cs, &sx.host);
+                            }
+                    }
                 } else
                 for (int t = tb; t < te; ++t) {
                     const QsaState& st = slot_ss(t).qsa_states[qi];   // the row's own K/V (ss's outside a batch)
@@ -1205,6 +1250,18 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                     native_qsa_indexer_append_steps(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos, kStepCount,
                                                     n, 0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                     rope_scaling(), cs);
+                } else if (batch_rec_ && g_night_attn_batch && dec_batch && !g_no_batch_kv) {
+                    // night: a slot's contiguous rows in one append (one work-group walks them in order, as the
+                    // single-row calls would one after another)
+                    for (int t = tb; t < te;) {
+                        const int first = t;
+                        while (t < te && brow_[t] == brow_[first]) ++t;
+                        const QsaState& sx = slot_ss(first).qsa_states[qi];
+                        const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
+                        native_qsa_indexer_append_steps(idx_raw + first * ID, step_ + first * kStepCount + kStepPos,
+                                                        kStepCount, t - first, 0, (const float*) wikn->data, EPS, ib, s,
+                                                        sx.max_cells, rope_scaling(), cs);
+                    }
                 } else {
                     for (int t = tb; t < te; ++t) {
                         const QsaState& sx = slot_ss(t).qsa_states[qi];
@@ -1276,6 +1333,61 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                 }
                 }
                 stamp(l, 10, grp);
+                if (batch_rec_ && g_night_attn_batch) {
+                    // night: the rows of a slot select and attend in one launch per kernel (each kernel's query z
+                    // reads only its own q / step / scores / selection / scratch rows: the per-row calls' bits);
+                    // mode 1 also runs the window's top-k, chunk (every slot's pools) and merge as one launch each
+                    int gb[kQsaAttnMaxPools + 1], ng = 0;
+                    bool groups_ok = true;
+                    for (int t = tb; t < te;) {
+                        const int first = t;
+                        while (t < te && brow_[t] == brow_[first]) ++t;
+                        if (ng < kQsaAttnMaxPools) gb[ng] = first; else groups_ok = false;
+                        ++ng;
+                    }
+                    if (ng <= kQsaAttnMaxPools) gb[ng] = te;
+                    const bool one = g_night_attn_batch == 1 && groups_ok;
+                    for (int t = tb; t < te;) {   // per slot: the scores (one read of the slot's pooled keys)
+                        const int first = t;
+                        while (t < te && brow_[t] == brow_[first]) ++t;
+                        const QsaState& sx = slot_ss(first).qsa_states[qi];
+                        qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + first * IQ * ID, step_ + first * kStepCount,
+                                         t - first, max_blocks_, s, scores_ + (size_t) first * max_blocks_, cs);
+                        if (!one)
+                            qsa_block_topk(scores_ + (size_t) first * max_blocks_, step_ + first * kStepCount, t - first,
+                                           max_blocks_, cap_, s, sel_ + (size_t) first * cap_, cs);
+                    }
+                    if (one)
+                        qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_,
+                                       s, sel_ + (size_t) tb * cap_, cs);
+                    stamp(l, 11, grp);
+                    for (int t = tb; t < te;) {
+                        const int first = t;
+                        while (t < te && brow_[t] == brow_[first]) ++t;
+                        qsa_kv_resolve(slot_ss(first).qsa_states[qi], *g_, sel_ + (size_t) first * cap_,
+                                       step_ + first * kStepCount, t - first, cap_, cs);
+                    }
+                    stamp(l, 12, grp);
+                    if (one) {
+                        QsaAttnPools pp[kQsaAttnMaxPools];
+                        int rows[kQsaAttnMaxPools];
+                        for (int k2 = 0; k2 < ng; ++k2) {
+                            pp[k2] = qsa_attn_pools(slot_ss(gb[k2]).qsa_states[qi]);
+                            rows[k2] = gb[k2 + 1] - gb[k2];
+                        }
+                        qsa_decode_attn_multi(qcur_ + tb * NH * HD, pp, rows, ng, sel_ + (size_t) tb * cap_,
+                                              step_ + tb * kStepCount, cap_, s,
+                                              attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, cs);
+                    } else
+                        for (int t = tb; t < te;) {
+                            const int first = t;
+                            while (t < te && brow_[t] == brow_[first]) ++t;
+                            qsa_decode_attn_batch(qcur_ + first * NH * HD, qsa_attn_pools(slot_ss(first).qsa_states[qi]),
+                                                  sel_ + (size_t) first * cap_, step_ + first * kStepCount, cap_, s,
+                                                  attn_scratch_ + (size_t) first * attn_scratch_floats_,
+                                                  attn_ + first * NH * HD, t - first, cs);
+                        }
+                } else
                 if (batch_rec_) {   // each row selects and attends over its own slot's K/V
                     for (int t = tb; t < te; ++t) {
                         const QsaState& sx = slot_ss(t).qsa_states[qi];

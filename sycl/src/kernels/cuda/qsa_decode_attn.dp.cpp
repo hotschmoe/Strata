@@ -611,6 +611,80 @@ __dpct_inline__ void attn_merge_kernel(const float *__restrict__ part_acc,
     attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
 }
 
+// Night-lab STRATA_NIGHT_ATTN_MERGE_ACTIVE: attn_merge_kernel with both loops bounded by the chunks the row's
+// selection reaches.  A chunk c >= ceil(width / CHUNK) has n_here <= 0, so attn_chunk_kernel wrote m = -FLT_MAX for
+// it: fmax(M, -FLT_MAX) == M in the first loop and the second loop `continue`s on it - the same bits, without the
+// serial walk over every chunk of the capacity (the MTP drafter's 32K window is 512 chunks).
+__dpct_inline__ void attn_merge_active_kernel(const float *__restrict__ part_acc,
+                                              const float *__restrict__ part_m,
+                                              const float *__restrict__ part_l,
+                                              int n_chunks, float *__restrict__ attn,
+                                              long long scratch_stride,
+                                              const int32_t *__restrict__ steps) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int z = (int) item_ct1.get_group(1);
+    part_acc += (size_t)z * (size_t)scratch_stride;
+    part_m += (size_t)z * (size_t)scratch_stride;
+    part_l += (size_t)z * (size_t)scratch_stride;
+    attn += (size_t)z * (size_t)item_ct1.get_group_range(2) * HD;
+    const int n_ids = steps[(size_t) z * kStepCount + kStepWidth];
+    const int n_act = n_ids <= 0 ? 0 : (n_ids + CHUNK - 1) / CHUNK;
+    const int nc = n_act < n_chunks ? n_act : n_chunks;
+    const int h = item_ct1.get_group(2); // global query head
+    const int kvh = h / G, hl = h % G;
+    const int d = item_ct1.get_local_id(2);
+    // the loads of MU chunks are issued together, then folded one by one in ascending order: the same operations
+    // in the same order as attn_merge_kernel (a 512-chunk MTP merge was one dependent load chain per thread)
+    constexpr int MU = 8;
+    const float* pm_h = part_m + (size_t) kvh * n_chunks * G + hl;
+    const float* pl_h = part_l + (size_t) kvh * n_chunks * G + hl;
+    const float* pa_h = part_acc + ((size_t) kvh * n_chunks * G + hl) * HD + d;
+    float M = -FLT_MAX;
+    int c = 0;
+    for (; c + MU <= nc; c += MU) {
+        float pm[MU];
+#pragma unroll
+        for (int j = 0; j < MU; ++j) pm[j] = pm_h[(size_t) (c + j) * G];
+#pragma unroll
+        for (int j = 0; j < MU; ++j) M = sycl::fmax(M, pm[j]);
+    }
+    for (; c < nc; ++c) M = sycl::fmax(M, pm_h[(size_t) c * G]);
+    float L = 0.0f, acc = 0.0f;
+    c = 0;
+    for (; c + MU <= nc; c += MU) {
+        float pm[MU], pl[MU], pa[MU];
+#pragma unroll
+        for (int j = 0; j < MU; ++j) {
+            pm[j] = pm_h[(size_t) (c + j) * G];
+            pl[j] = pl_h[(size_t) (c + j) * G];
+            pa[j] = pa_h[(size_t) (c + j) * G * HD];
+        }
+#pragma unroll
+        for (int j = 0; j < MU; ++j) {
+            if (pm[j] == -FLT_MAX) continue;
+            const float w = sycl::native::exp(pm[j] - M);
+            L = sycl::fma(pl[j], w, L);
+            acc = sycl::fma(pa[j], w, acc);
+        }
+    }
+    for (; c < nc; ++c) {
+        const float m = pm_h[(size_t) c * G];
+        if (m == -FLT_MAX) continue;
+        const float w = sycl::native::exp(m - M);
+        L = sycl::fma(pl_h[(size_t) c * G], w, L);
+        acc = sycl::fma(pa_h[(size_t) c * G * HD], w, acc);
+    }
+    attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
+}
+
+// Night-lab STRATA_NIGHT_ATTN_BATCH: up to kQsaAttnMaxPools KV pool sets in one launch; query z reads the set whose
+// row range holds it (a work-group-uniform choice), everything else is attn_chunk_kernel's.
+struct AttnMultiPools {
+    QsaAttnPools p[kQsaAttnMaxPools];
+    int zbeg[kQsaAttnMaxPools];   // first row of each set
+    int n;
+};
+
 #if defined(STRATA_EXPERIMENTAL_SM60)
 // the current device is below sm_75 (per device: a layer split can mix cards); STRATA_ATTN_PRE75=0 turns PR #540's
 // kernel off (A/B)
@@ -648,6 +722,14 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         !pools.page_table || n_q > 65535) {
         std::fprintf(stderr, "qsa_decode_attn_batch: unsupported geometry or missing buffers\n");
         std::exit(1);
+    }
+    // night-lab: a decode-sized call (verify window, MTP body) through the bitwise-equal night launch when one of its
+    // switches is on; prompt chunks (n_q > 8) keep the original kernels
+    static const bool night_lane_cell = [] { const char* v = std::getenv("STRATA_ATTN_LANECELL"); return v && v[0] == '1'; }();
+    if (n_q <= 8 && !night_lane_cell && (qsa_night_vpipe() || qsa_night_merge_active())) {
+        const int rows = (int) n_q;
+        qsa_decode_attn_multi(q, &pools, &rows, 1, ids, steps, cap, s, scratch, attn, stream);
+        return;
     }
     const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
                         : (pools.k_q != nullptr ? 1 : 0));
@@ -791,6 +873,135 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     need to rewrite this code.
     */
     const dpct::err0 e = 0;
+}
+
+// ---- night-lab: several pool sets in one launch, the active-bounded merge, the value-pipelined decode chunk
+template <int KV_MODE, bool VP> class attn_chunk_multi_night;   // kernel names: namespace scope (globally visible)
+class attn_merge_night;
+class attn_merge_active_night;
+namespace {
+bool night_env(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+int kv_mode_of(const QsaAttnPools& p) {
+    return p.k_q4 != nullptr ? 2 : (p.k_q != nullptr && p.v_q4 != nullptr ? 3 : (p.k_q != nullptr ? 1 : 0));
+}
+template <int M, bool VP>
+void launch_chunk_multi(dpct::queue_ptr st, const sycl::range<3>& groups, const float* q, const AttnMultiPools& mp,
+                        const int32_t* ids, const int32_t* steps, int n_kv_heads, int page_size, float scale,
+                        float* part_acc, float* part_m, float* part_l, int n_chunks, int cap, long long stride) {
+    auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+    const AttnMultiPools mpv = mp;
+    st->parallel_for<attn_chunk_multi_night<M, VP>>(
+        sycl::nd_range<3>(groups * sycl::range<3>(1, 1, THREADS), sycl::range<3>(1, 1, THREADS)), exp_props,
+        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+            const int z = (int) item_ct1.get_group(0);
+            QsaAttnPools p = mpv.p[0];
+#pragma unroll
+            for (int k = 1; k < kQsaAttnMaxPools; ++k)
+                if (k < mpv.n && z >= mpv.zbeg[k]) p = mpv.p[k];
+            attn_chunk_kernel<M, false, VP>(q, p, ids, steps, n_kv_heads, page_size, scale, part_acc, part_m,
+                                            part_l, n_chunks, cap, stride);
+        });
+}
+}  // namespace
+
+bool qsa_night_merge_active() {
+    static const bool on = [] {
+        const bool v = night_env("STRATA_NIGHT_ATTN_MERGE_ACTIVE");
+        if (v) std::fprintf(stderr, "strata night: STRATA_NIGHT_ATTN_MERGE_ACTIVE=1 (decode attention merge over active chunks, loads 8 deep, bitwise)\n");
+        return v;
+    }();
+    return on;
+}
+bool qsa_night_vpipe() {
+    static const bool on = [] {
+        const bool v = night_env("STRATA_NIGHT_ATTN_VPIPE");
+        if (v) std::fprintf(stderr, "strata night: STRATA_NIGHT_ATTN_VPIPE=1 (decode attention value-pipelined chunk kernel, bitwise)\n");
+        return v;
+    }();
+    return on;
+}
+
+void qsa_decode_attn_multi(const float* q, const QsaAttnPools* pools, const int* rows, int n_pools, const int32_t* ids,
+                           const int32_t* steps, int64_t cap, const QsaShapes& s, float* scratch, float* attn,
+                           void* stream) {
+    if (n_pools <= 0) return;
+    int64_t n_q = 0;
+    bool uniform = n_pools <= kQsaAttnMaxPools;
+    const int kv_mode = kv_mode_of(pools[0]);
+    for (int k = 0; k < n_pools; ++k) {
+        n_q += rows[k];
+        if (kv_mode_of(pools[k]) != kv_mode) uniform = false;
+        if (!pools[k].page_table) {
+            std::fprintf(stderr, "qsa_decode_attn_multi: missing page table\n");
+            std::exit(1);
+        }
+    }
+    static const bool lane_cell = [] { const char* v = std::getenv("STRATA_ATTN_LANECELL"); return v && v[0] == '1'; }();
+    if (n_q <= 0) return;
+    if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
+        n_q > 65535) {
+        std::fprintf(stderr, "qsa_decode_attn_multi: unsupported geometry or missing buffers\n");
+        std::exit(1);
+    }
+    if (!uniform || lane_cell) {
+        // not one launch: one call per pool set (LANECELL: the original entrypoint, whose night hook is off then)
+        const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
+        int64_t r0 = 0;
+        for (int k = 0; k < n_pools; ++k) {
+            if (rows[k] > 0) {
+                const float* qk = q + (size_t) r0 * s.n_head * HD;
+                const int32_t* idk = ids + (size_t) r0 * cap;
+                const int32_t* stk = steps + (size_t) r0 * kStepCount;
+                float* sck = scratch + (size_t) r0 * stride;
+                float* atk = attn + (size_t) r0 * s.n_head * HD;
+                if (lane_cell) qsa_decode_attn_batch(qk, pools[k], idk, stk, cap, s, sck, atk, rows[k], stream);
+                else qsa_decode_attn_multi(qk, &pools[k], &rows[k], 1, idk, stk, cap, s, sck, atk, stream);
+            }
+            r0 += rows[k];
+        }
+        return;
+    }
+    const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
+    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
+    float* part_acc = scratch;
+    float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
+    float* part_l = part_m + (size_t) n_chunks * s.n_head;
+    const float scale = 1.0f / sqrtf((float) HD);
+    AttnMultiPools mp{};
+    {
+        int r0 = 0;
+        for (int k = 0; k < n_pools; ++k) { mp.p[k] = pools[k]; mp.zbeg[k] = r0; r0 += rows[k]; }
+        for (int k = n_pools; k < kQsaAttnMaxPools; ++k) { mp.p[k] = pools[0]; mp.zbeg[k] = r0 + 1 + 65536; }
+        mp.n = n_pools;
+    }
+    const sycl::range<3> groups((size_t) n_q, (size_t) s.n_head_kv, (size_t) n_chunks);
+    dpct::queue_ptr st = strata::q_of(stream);
+    dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+    const bool vp = qsa_night_vpipe();
+    const int nkv = (int) s.n_head_kv, ps = (int) s.page_size, capi = (int) cap;
+    if (kv_mode == 3) { if (vp) launch_chunk_multi<3, true>(st, groups, q, mp, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_chunks, capi, stride);
+                        else launch_chunk_multi<3, false>(st, groups, q, mp, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_chunks, capi, stride); }
+    else if (kv_mode == 2) { if (vp) launch_chunk_multi<2, true>(st, groups, q, mp, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_chunks, capi, stride);
+                             else launch_chunk_multi<2, false>(st, groups, q, mp, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_chunks, capi, stride); }
+    else if (kv_mode == 1) { if (vp) launch_chunk_multi<1, true>(st, groups, q, mp, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_chunks, capi, stride);
+                             else launch_chunk_multi<1, false>(st, groups, q, mp, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_chunks, capi, stride); }
+    else { if (vp) launch_chunk_multi<0, true>(st, groups, q, mp, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_chunks, capi, stride);
+           else launch_chunk_multi<0, false>(st, groups, q, mp, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_chunks, capi, stride); }
+    auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+    const sycl::nd_range<3> mr(sycl::range<3>(1, (size_t) n_q, (size_t) s.n_head) * sycl::range<3>(1, 1, HD),
+                               sycl::range<3>(1, 1, HD));
+    if (qsa_night_merge_active()) {
+        st->parallel_for<attn_merge_active_night>(mr, exp_props, [=](sycl::nd_item<3> item_ct1) {
+            attn_merge_active_kernel(part_acc, part_m, part_l, n_chunks, attn, stride, steps);
+        });
+    } else {
+        st->parallel_for<attn_merge_night>(mr, exp_props, [=](sycl::nd_item<3> item_ct1) {
+            attn_merge_kernel(part_acc, part_m, part_l, n_chunks, attn, stride);
+        });
+    }
 }
 
 // S93: only the staged prefill caller opts in; decode/verify/MTP keep the original entrypoint.
