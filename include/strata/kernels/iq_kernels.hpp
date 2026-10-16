@@ -89,6 +89,10 @@ void native_expert_set_mode(int mode, int phase);
 void iq_set_old_kernels(bool old);
 /// night lab bench: the STRATA_NIGHT_EP_ROWS kernels with rpl rows per lane (2; 0 off; -1 the environment's)
 void native_expert_set_night_rows(int rpl);
+/// night lab bench: the STRATA_NIGHT_IQ decodes (1 on, 0 off, -1 the environment's; set before capture)
+void native_expert_set_night_iq(int on);
+void native_expert_set_night_iq_alu(int on);      ///< night lab bench: STRATA_NIGHT_IQ_ALU (1/0/-1 env)
+void native_expert_set_night_iq4nl_tab(int on);   ///< night lab bench: STRATA_NIGHT_IQ4NL_TAB (1/0/-1 env)
 bool iq_old_kernels();
 
 }  // namespace strata::kernels

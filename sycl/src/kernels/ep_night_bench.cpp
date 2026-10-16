@@ -154,19 +154,22 @@ struct Grouped {
             sycl::free(p, q);
     }
     // the whole call once from a NaN-filled output; the output bits
-    std::vector<uint32_t> result(sycl::queue& q, int rows) {
+    std::vector<uint32_t> result(sycl::queue& q, int rows, int iq = 0, int layer = 0) {
         q.memset(out, 0xFF, (size_t) cap * 2560 * 4).wait();
         q.memset(scr, 0x3C, k::native_expert_scratch_bytes(cap, 640)).wait();
         k::native_expert_set_night_rows(rows);
-        k::native_expert_grouped(L, lptr[0], start, n, dst, tok, cap, cap, xq, scr, out, &q, 0);
+        k::native_expert_set_night_iq(iq);
+        k::native_expert_grouped(L, lptr[(size_t) layer], start, n, dst, tok, cap, cap, xq, scr, out, &q, 0);
         k::native_expert_set_night_rows(0);
+        k::native_expert_set_night_iq(0);
         q.wait();
         std::vector<uint32_t> o((size_t) cap * 2560);
         q.memcpy(o.data(), out, o.size() * 4).wait();
         return o;
     }
-    double run(sycl::queue& q, int phase, int64_t gy, int reps, int rows = 0) {
+    double run(sycl::queue& q, int phase, int64_t gy, int reps, int rows = 0, int iq = 0) {
         k::native_expert_set_night_rows(rows);
+        k::native_expert_set_night_iq(iq);
         k::native_expert_set_mode(-1, phase);
         const double us = time_graph_us(q, [&] {
             for (int l = 0; l < NL; ++l)
@@ -174,6 +177,7 @@ struct Grouped {
         }, NL, reps);
         k::native_expert_set_mode(-1, 0);
         k::native_expert_set_night_rows(0);
+        k::native_expert_set_night_iq(0);
         return us;
     }
 };
@@ -187,37 +191,55 @@ std::vector<int> sizes_of(std::initializer_list<std::pair<int, int>> v) {   // {
 int g_bad = 0;
 int grouped_bench(int reps) {
     sycl::queue& q = Q();
+    if (const char* t = std::getenv("EPB_NLTAB")) k::native_expert_set_night_iq4nl_tab(std::atoi(t));
+    if (const char* t = std::getenv("EPB_ALU")) k::native_expert_set_night_iq_alu(std::atoi(t));
     std::mt19937 rng(1016);
     const Scenario scs[] = {
-        {"C2 card0 14g/30e", 6, sizes_of({{1, 4}, {3, 3}, {7, 2}, {3, 1}})},
-        {"C2 card1 26g/30e", 6, sizes_of({{4, 2}, {22, 1}})},
+        {"E1 30g x1 (T8)", 8, sizes_of({{30, 1}})},
+        {"E2 15g x2 (T8)", 8, sizes_of({{15, 2}})},
+        {"E3 10g x3 (T8)", 8, sizes_of({{10, 3}})},
         {"C1 card0 10g/20e", 4, sizes_of({{2, 3}, {6, 2}, {2, 1}})},
         {"C1 card1 18g/20e", 4, sizes_of({{2, 2}, {16, 1}})},
+        {"C2 card0 14g/30e", 6, sizes_of({{1, 4}, {3, 3}, {7, 2}, {3, 1}})},
+        {"C2 card1 26g/30e", 6, sizes_of({{4, 2}, {22, 1}})},
+        {"C4 card0 19g/40e", 8, sizes_of({{2, 4}, {4, 3}, {7, 2}, {6, 1}})},
+        {"C4 card1 32g/40e", 8, sizes_of({{8, 2}, {24, 1}})},
     };
     const int pairs[][2] = {{16, 42}, {17, 20}, {21, 42}, {22, 42}, {18, 20}};
-    std::printf("grouped: us per call (48 layers per graph, median of 5 x %d replays); GB/s = groups x blob bytes / call\n", reps);
-    std::printf("%-8s/%-7s %-18s %8s %8s %8s | %8s %8s %8s | %6s %6s | %s\n", "gate/up", "down", "scenario",
-                "gu+sw", "down", "all", "R2:gu+sw", "R2:down", "R2:all", "GB/s", "R2GB/s", "rows vs base");
-    // EPB_PAIRS="16:42,21:42" / EPB_SCEN="01" restrict the table (default: all)
+    // EPB_PAIRS="16:42,21:42" / EPB_SCEN="0123" restrict the table (default: all)
     const char* fp = std::getenv("EPB_PAIRS");
     const char* fs = std::getenv("EPB_SCEN");
-    int si = -1;
+    std::printf("grouped: us per call (48 layers per graph, median of 5 x %d replays); base = current kernels, R2 =\n"
+                "STRATA_NIGHT_EP_ROWS=2, IQ = STRATA_NIGHT_IQ=1 (1 row), IQR2 = both; gu = gate/up + swiglu phase, dn = all - gu;\n"
+                "GB/s = groups x blob bytes / all; every variant compared bitwise with base\n", reps);
+    std::printf("%-8s/%-7s %-17s | %7s %7s %7s | %7s %7s | %7s %7s %7s | %7s %7s %7s | %6s %6s | %s\n", "gate/up", "down",
+                "scenario", "gu", "dn", "all", "R2:gu", "R2:all", "IQ:gu", "IQ:dn", "IQ:all", "IQR2:gu", "IQR2:dn", "IQR2:all",
+                "GB/s", "IQGB/s", "bitwise");
     for (const auto& pr : pairs)
         for (const auto& sc : scs) {
-            si = (int) (&sc - scs);
+            const int si = (int) (&sc - scs);
             if (fp && !std::strstr(fp, (std::to_string(pr[0]) + ":" + std::to_string(pr[1])).c_str())) continue;
             if (fs && !std::strchr(fs, '0' + si)) continue;
             Grouped G(pr[0], pr[1], sc, 48, rng, q);
-            const double gu = G.run(q, 1, 0, reps), dn = G.run(q, 2, 0, reps), all = G.run(q, 0, 0, reps);
-            const double g2 = G.run(q, 1, 0, reps, 2), d2 = G.run(q, 2, 0, reps, 2), a2 = G.run(q, 0, 0, reps, 2);
-            const auto a = G.result(q, 0), b = G.result(q, 2);
+            const double gu = G.run(q, 1, 0, reps), all = G.run(q, 0, 0, reps);
+            const double g2 = G.run(q, 1, 0, reps, 2), a2 = G.run(q, 0, 0, reps, 2);
+            const double gi = G.run(q, 1, 0, reps, 0, 1), ai = G.run(q, 0, 0, reps, 0, 1);
+            const double gj = G.run(q, 1, 0, reps, 2, 1), aj = G.run(q, 0, 0, reps, 2, 1);
             size_t diff = 0, written = 0;
-            for (size_t i = 0; i < a.size(); ++i) { diff += a[i] != b[i]; written += a[i] != 0xFFFFFFFFu; }
+            for (int layer : {0, 17, 47}) {   // three layers' blobs
+                const auto a = G.result(q, 0, 0, layer), b = G.result(q, 2, 0, layer), c = G.result(q, 0, 1, layer),
+                           d = G.result(q, 2, 1, layer);
+                for (size_t i = 0; i < a.size(); ++i) {
+                    diff += (a[i] != b[i]) + (a[i] != c[i]) + (a[i] != d[i]);
+                    written += a[i] != 0xFFFFFFFFu;
+                }
+            }
             g_bad += diff != 0 || written == 0;
             const double mb = (double) G.ng * (double) G.L.bytes / 1e6;
-            std::printf("%-8s/%-7s %-18s %8.2f %8.2f %8.2f | %8.2f %8.2f %8.2f | %6.1f %6.1f | %s (%zu written, %zu differ)\n",
-                        name_of(pr[0]), name_of(pr[1]), sc.what, gu, dn, all, g2, d2, a2, mb * 1e3 / all,
-                        mb * 1e3 / a2, diff == 0 && written ? "bitwise" : "FAIL", written, diff);
+            std::printf("%-8s/%-7s %-17s | %7.2f %7.2f %7.2f | %7.2f %7.2f | %7.2f %7.2f %7.2f | %7.2f %7.2f %7.2f | %6.1f %6.1f | %s (%zu, %zu)\n",
+                        name_of(pr[0]), name_of(pr[1]), sc.what, gu, all - gu, all, g2, a2, gi, ai - gi, ai, gj, aj - gj, aj,
+                        mb * 1e3 / all, mb * 1e3 / std::min(ai, aj), diff == 0 && written ? "yes" : "FAIL", written, diff);
+            std::fflush(stdout);
         }
     std::printf("grouped: %d failures\n", g_bad);
     return g_bad ? 1 : 0;
