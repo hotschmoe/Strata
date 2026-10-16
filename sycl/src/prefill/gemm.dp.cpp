@@ -1008,6 +1008,23 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         }
         return;
     }
+    if (dqc_on_) {   // night lab DQCACHE: the second half of a layer finds the first half's dequantized weight
+        for (int i = 0; i < dqc_n_; ++i)
+            if (dqc_ent_[i].w == W_blocks && dqc_ent_[i].N == N && dqc_ent_[i].K == K) {
+                ++dqc_hits_;
+                f16(X, dqc_ + dqc_ent_[i].off, Y, T, N, K, ldy, beta);
+                return;
+            }
+        const size_t need = (size_t) (N * K + 127) & ~(size_t) 127;
+        if (dqc_n_ < kDqcMax && dqc_used_ + need <= dqc_elems_) {
+            uint16_t* dst = dqc_ + dqc_used_;
+            dqc_ent_[dqc_n_++] = {W_blocks, N, K, dqc_used_};
+            dqc_used_ += need;
+            strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, dst, stream_);
+            f16(X, dst, Y, T, N, K, ldy, beta);
+            return;
+        }
+    }
     strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
     f16(X, scratch_, Y, T, N, K, ldy, beta);
 }

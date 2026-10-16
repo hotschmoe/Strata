@@ -5517,6 +5517,8 @@ void iq_dequant_expert_f16(int gt, int dt, const void* gate, const void* up, con
         std::fprintf(stderr, "iq_dequant_expert_f16: types %d/%d, %lld x %lld\n", gt, dt, (long long) n_ff, (long long) n_embd);
         std::exit(1);
     }
+    // night lab STRATA_NIGHT_PREFILL_DQ32=1: the same values from one work-item per 32-value sub-block
+    if (night_dq32_on() && night_dequant_expert_f16(gt, dt, gate, up, down, n_ff, n_embd, dst_gu, dst_d, stream)) return;
     const int64_t per_row = n_embd / 256, gu_wgs = 2 * n_ff * per_row, d_wgs = n_ff * n_embd / 256;
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{

@@ -55,11 +55,27 @@ public:
     /// Caller-owned buffers only: the scratch and workspace moved (the prompt path laid its buffers out again).
     void rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes);
 
+    /// Night lab STRATA_NIGHT_PREFILL_DQCACHE (HALVES): native() keeps each dequantized weight in `buf` (elems FP16
+    /// values) while enabled, and a later native() of the same weight (same blocks, N, K) skips the dequant: the
+    /// GEMM reads the same FP16 values, so the products are bitwise the same.  reset() forgets the entries.
+    void dqc_attach(uint16_t* buf, size_t elems) { dqc_ = buf; dqc_elems_ = elems; dqc_reset(); }
+    void dqc_reset() { dqc_used_ = 0; dqc_n_ = 0; }
+    void dqc_enable(bool on) { dqc_on_ = on && dqc_ != nullptr; }
+    int64_t dqc_hits() const { return dqc_hits_; }
+
     uint16_t* scratch() const { return scratch_; }
     int64_t scratch_elems() const { return scratch_elems_; }
     void* stream() const { return stream_; }
 
 private:
+    uint16_t* dqc_ = nullptr;
+    size_t dqc_elems_ = 0, dqc_used_ = 0;
+    bool dqc_on_ = false;
+    int64_t dqc_hits_ = 0;
+    static constexpr int kDqcMax = 16;
+    struct DqcEntry { const void* w; int64_t N, K; size_t off; };
+    DqcEntry dqc_ent_[kDqcMax] = {};
+    int dqc_n_ = 0;
     void* handle_ = nullptr;
     void* stream_ = nullptr;
     uint16_t* scratch_ = nullptr;

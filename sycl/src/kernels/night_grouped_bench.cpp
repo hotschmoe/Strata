@@ -4,6 +4,8 @@
 //   night_grouped_bench mix gt dt T n_exp median sigma max_rows   (lognormal mix, experts <= max_rows only, GU + down)
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/night_grouped.hpp"
+#include "strata/kernels/iq_dequant_expert.hpp"
+#include "strata/kernels/dequant_bf16.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/sycl_queue.hpp"
@@ -167,6 +169,77 @@ int main(int argc, char** argv) {
     // in place), then batches of small experts (<= T rows) from the last batch down: grouped gate/up -> GUf, one
     // swiglu -> Hh, grouped down -> rows in place.  Compared with every expert on the reference path (no alias).
     //   night_grouped_bench pipe gt dt T n_exp median sigma G
+    // dq: STRATA_NIGHT_PREFILL_DQ32's dequant against iq_dequant_expert_f16 (bitwise), GPU time per expert
+    //   night_grouped_bench dq gt dt n_experts
+    // ddq: STRATA_NIGHT_PREFILL_DDQ's dense FP16 dequant vs the original (bitwise) and GPU time
+    //   night_grouped_bench ddq type rows cols
+    if (mode == "ddq") {
+        const int ty = std::atoi(argv[2]);
+        const int64_t R = std::atoll(argv[3]), C = std::atoll(argv[4]);
+        const size_t rb = sk::iq_row_bytes(ty, C) ? sk::iq_row_bytes(ty, C) : 0;
+        int be = ty == 42 ? 64 : (ty == 2 || ty == 6 || ty == 7 || ty == 8 || ty == 20) ? 32 : 256;
+        int bb = ty == 2 ? 18 : ty == 6 ? 22 : ty == 7 ? 24 : ty == 8 ? 34 : ty == 20 ? 18 : ty == 11 ? 110 : ty == 12 ? 144 :
+                 ty == 13 ? 176 : ty == 14 ? 210 : ty == 23 ? 136 : 18;
+        (void) rb;
+        const size_t bytes = (size_t) R * (C / be) * bb;
+        std::vector<uint8_t> hb(bytes);
+        for (auto& x : hb) x = (uint8_t) rng();
+        for (size_t o = 0; o + 1 < bytes; o += bb) { hb[o] = 0x00; hb[o + 1] = 0x2C; }
+        uint8_t* Wd = sycl::malloc_device<uint8_t>(bytes, *q);
+        q->memcpy(Wd, hb.data(), bytes).wait();
+        uint16_t* a = sycl::malloc_device<uint16_t>((size_t) R * C, *q);
+        uint16_t* b = sycl::malloc_device<uint16_t>((size_t) R * C, *q);
+        sk::night_ddq_override(0); sk::dequant_f16(ty, Wd, 0, R, C, a, q);
+        sk::night_ddq_override(1); sk::dequant_f16(ty, Wd, 0, R, C, b, q);
+        q->wait();
+        std::vector<uint16_t> ha((size_t) R * C), hb2((size_t) R * C);
+        q->memcpy(ha.data(), a, ha.size() * 2); q->memcpy(hb2.data(), b, hb2.size() * 2).wait();
+        const bool same = std::memcmp(ha.data(), hb2.data(), ha.size() * 2) == 0;
+        double h0, g0, h1, g1;
+        cx.time([&] { sk::night_ddq_override(0); sk::dequant_f16(ty, Wd, 0, R, C, a, q); }, 5, h0, g0);
+        cx.time([&] { sk::night_ddq_override(1); sk::dequant_f16(ty, Wd, 0, R, C, b, q); }, 5, h1, g1);
+        sk::night_ddq_override(-1);
+        const double mb = (bytes + (double) R * C * 2) / 1e6;
+        std::printf("ddq type %2d %lld x %lld: %s | original %.3f ms (%.0f GB/s), coalesced %.3f ms (%.0f GB/s), %.2fx\n", ty,
+                    (long long) R, (long long) C, same ? "bitwise equal" : "DIFFER", g0, mb / g0, g1, mb / g1, g0 / g1);
+        return 0;
+    }
+    if (mode == "dq") {
+        const int gt = std::atoi(argv[2]), dt = std::atoi(argv[3]), n = argc > 4 ? std::atoi(argv[4]) : 16;
+        const size_t gmat = sk::iq_row_bytes(gt, NE) * FF, dmat = sk::iq_row_bytes(dt, FF) * NE;
+        const size_t up_off = gmat, down_off = 2 * gmat, blob = (down_off + dmat + 255) & ~(size_t) 255;
+        uint8_t* W = sycl::malloc_device<uint8_t>(blob * n, *q);
+        for (int e = 0; e < n; ++e) {
+            auto g = rand_mat(rng, gt, FF, NE), u = rand_mat(rng, gt, FF, NE), d = rand_mat(rng, dt, NE, FF);
+            q->memcpy(W + e * blob, g.data(), gmat); q->memcpy(W + e * blob + up_off, u.data(), gmat);
+            q->memcpy(W + e * blob + down_off, d.data(), dmat); q->wait();
+        }
+        uint16_t *ga = sycl::malloc_device<uint16_t>((size_t) 1280 * NE, *q), *da = sycl::malloc_device<uint16_t>((size_t) NE * 640, *q);
+        uint16_t *gb = sycl::malloc_device<uint16_t>((size_t) 1280 * NE, *q), *db = sycl::malloc_device<uint16_t>((size_t) NE * 640, *q);
+        size_t bad = 0;
+        std::vector<uint16_t> h1((size_t) 1280 * NE), h2((size_t) 1280 * NE), h3((size_t) NE * 640), h4((size_t) NE * 640);
+        for (int e = 0; e < n; ++e) {
+            const uint8_t* bd = W + e * blob;
+            sk::night_dq32_override(0); sk::iq_dequant_expert_f16(gt, dt, bd, bd + up_off, bd + down_off, FF, NE, ga, da, q);
+            sk::night_dq32_override(1); sk::iq_dequant_expert_f16(gt, dt, bd, bd + up_off, bd + down_off, FF, NE, gb, db, q);
+            q->memcpy(h1.data(), ga, h1.size() * 2); q->memcpy(h2.data(), gb, h2.size() * 2);
+            q->memcpy(h3.data(), da, h3.size() * 2); q->memcpy(h4.data(), db, h4.size() * 2); q->wait();
+            bad += std::memcmp(h1.data(), h2.data(), h1.size() * 2) != 0;
+            bad += std::memcmp(h3.data(), h4.data(), h3.size() * 2) != 0;
+        }
+        double hr, gr, hn, gn;
+        auto loop = [&](int on) {
+            sk::night_dq32_override(on);
+            for (int e = 0; e < 64; ++e) { const uint8_t* bd = W + (e % n) * blob; sk::iq_dequant_expert_f16(gt, dt, bd, bd + up_off, bd + down_off, FF, NE, ga, da, q); }
+        };
+        cx.time([&] { loop(0); }, 3, hr, gr);
+        cx.time([&] { loop(1); }, 3, hn, gn);
+        sk::night_dq32_override(-1);
+        std::printf("dq gt %2d dt %2d: %d experts, %zu of %d matrices differ (want 0) | per expert: iq_dequant_expert_f16 %.2f us, "
+                    "dq32 %.2f us (%.2fx), host %.2f / %.2f us\n", gt, dt, n, bad, 2 * n, gr * 1000 / 64, gn * 1000 / 64,
+                    gr / gn, hr * 1000 / 64, hn * 1000 / 64);
+        return 0;
+    }
     if (mode == "pipe") {
         const int gt = std::atoi(argv[2]), dt = std::atoi(argv[3]);
         const int64_t T = std::atoll(argv[4]);

@@ -344,6 +344,162 @@ bool by_mt(sycl::queue& q, int mt, const NightGroupedEntry* ent, int n_ent, cons
 }
 }  // namespace nightg
 
+namespace nightg {
+// one 8-value run il (0..3) of sub-block ib of superblock ibs, loading only what the run needs (the original run
+// decoders' loads, as 2-byte words where they are byte pairs), the IQ2 sign byte computed and the masks as shifts, the
+// grid entry as one 64- or 32-bit load; no register array indexed by il.  Values bit for bit the dq_* ones.
+inline uint32_t ld8(const uint8_t* p) { return *p; }
+template <int TY>
+inline void dq_run_fast(const uint8_t* vx, int64_t ibs, int ib, int il, float* v) {
+    if constexpr (TY == 21) {   // IQ3_S
+        const uint8_t* x = vx + ibs * 110;
+        const float d = h2f(ld16(x)) * (1 + 2 * ((ld8(x + 106 + ib / 2) >> 4 * (ib % 2)) & 0xf));
+        const uint32_t qh = ld8(x + 66 + ib), qw = ld16(x + 2 + 8 * ib + 2 * il), signs = ld8(x + 74 + 4 * ib + il);
+        const uint32_t g1 = iq3s_grid[(qw & 0xff) | ((qh << (8 - 2 * il)) & 256)];
+        const uint32_t g2 = iq3s_grid[(qw >> 8) | ((qh << (7 - 2 * il)) & 256)];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            v[j] = d * (float) ((g1 >> (8 * j)) & 0xff) * ((signs >> j) & 1 ? -1.f : 1.f);
+            v[4 + j] = d * (float) ((g2 >> (8 * j)) & 0xff) * ((signs >> (j + 4)) & 1 ? -1.f : 1.f);
+        }
+    } else if constexpr (TY == 16) {   // IQ2_XXS
+        const uint8_t* x = vx + ibs * 66;
+        const uint32_t aux32 = ld16(x + 6 + 8 * ib) | (ld16(x + 8 + 8 * ib) << 16);
+        const float d = h2f(ld16(x)) * (0.5f + (aux32 >> 28)) * 0.25f;
+        const uint64_t g = iq2xxs_grid[ld8(x + 2 + 8 * ib + il)];
+        const uint32_t signs = ksign7((aux32 >> 7 * il) & 127);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) v[j] = d * (float) ((g >> (8 * j)) & 0xff) * ((signs >> j) & 1 ? -1.f : 1.f);
+    } else if constexpr (TY == 18) {   // IQ3_XXS
+        const uint8_t* x = vx + ibs * 98;
+        const uint32_t aux32 = ld16(x + 66 + 4 * ib) | (ld16(x + 68 + 4 * ib) << 16);
+        const float d = h2f(ld16(x)) * (0.5f + (aux32 >> 28)) * 0.5f;
+        const uint32_t qw = ld16(x + 2 + 8 * ib + 2 * il);
+        const uint32_t g1 = iq3xxs_grid[qw & 0xff], g2 = iq3xxs_grid[qw >> 8];
+        const uint32_t signs = ksign7((aux32 >> 7 * il) & 127);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            v[j] = d * (float) ((g1 >> (8 * j)) & 0xff) * ((signs >> j) & 1 ? -1.f : 1.f);
+            v[4 + j] = d * (float) ((g2 >> (8 * j)) & 0xff) * ((signs >> (j + 4)) & 1 ? -1.f : 1.f);
+        }
+    } else if constexpr (TY == 17) {   // IQ2_XS
+        const uint8_t* x = vx + ibs * 74;
+        const uint32_t q = ld16(x + 2 + 8 * ib + 2 * il);
+        const uint64_t g = iq2xs_grid[q & 511];
+        const float d = h2f(ld16(x)) * (0.5f + ((ld8(x + 66 + ib) >> 4 * (il / 2)) & 0xf)) * 0.25f;
+        const uint32_t signs = ksign7(q >> 9);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) v[j] = d * (float) ((g >> (8 * j)) & 0xff) * ((signs >> j) & 1 ? -1.f : 1.f);
+    } else if constexpr (TY == 22) {   // IQ2_S
+        const uint8_t* x = vx + ibs * 82;
+        const uint64_t g = iq2s_grid[ld8(x + 2 + 4 * ib + il) | ((ld8(x + 66 + ib) << (8 - 2 * il)) & 0x300)];
+        const float d = h2f(ld16(x)) * (0.5f + ((ld8(x + 74 + ib) >> 4 * (il / 2)) & 0xf)) * 0.25f;
+        const uint32_t signs = ld8(x + 34 + 4 * ib + il);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) v[j] = d * (float) ((g >> (8 * j)) & 0xff) * ((signs >> j) & 1 ? -1.f : 1.f);
+    } else if constexpr (TY == 42) {   // Q2_0: sub-block ib = half ib % 2 of block ib / 2; run il = 8 values
+        const uint8_t* x = vx + (ibs * 4 + ib / 2) * 18;
+        const float d = h2f(ld16(x));
+        const uint32_t w = ld16(x + 2 + 8 * (ib % 2) + 2 * il);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) v[j] = d * (float) ((int) ((w >> (2 * j)) & 3) - 1);
+    } else if constexpr (TY == 20) {   // IQ4_NL: run il = values 8 il .. of the block: il < 2 low nibbles of qs[8 (il & 1) ..]
+        const uint8_t* x = vx + (ibs * 8 + ib) * 18;
+        const float d = h2f(ld16(x));
+        const int sh = il < 2 ? 0 : 4;
+        const uint8_t* q4 = x + 2 + 8 * (il & 1);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t q = ld16(q4 + 2 * i);
+            v[2 * i] = d * kvalues_iq4nl[(q >> sh) & 0xf];
+            v[2 * i + 1] = d * kvalues_iq4nl[(q >> (8 + sh)) & 0xf];
+        }
+    }
+}
+
+}  // namespace nightg
+
+// ---- night lab STRATA_NIGHT_PREFILL_DQ32=1: iq_dequant_expert_f16 with one work-item per 32-value sub-block (the
+// fields shared by its four runs loaded once, signs computed: load_raw + decode above), the same FP16 values and the
+// same layout (gate/up interleaved rows 2r / 2r + 1, then the down matrix flat).  Consecutive work-items take
+// consecutive sub-blocks of a row: their 64-byte writes are contiguous.
+namespace nightg {
+template <int GT, int DT> class k_night_dq32;
+template <int GT, int DT>
+void dq32_launch(sycl::queue& q, const uint8_t* gate, const uint8_t* up, const uint8_t* down, int64_t n_ff, int64_t n_embd,
+                 half* ygu, half* yd) {
+    // one work-item per 8-value run; run u writes values [8u, 8u + 8) of the gate/up image (then of the down matrix):
+    // consecutive lanes write consecutive 16 bytes, as the original kernel.  32-bit index math on this model's shape
+    // (n_embd 2560, n_ff 640: constants, so the divisions are multiply-shifts).
+    constexpr uint32_t NE = 2560, FF = 640, RUNS_ROW = NE / 8;   // 320 runs per gate/up virtual row
+    constexpr uint32_t gu_units = 2 * FF * RUNS_ROW, d_units = FF * NE / 8, units = gu_units + d_units;
+    (void) n_ff; (void) n_embd;
+    constexpr size_t WG = 256;
+    q.parallel_for<k_night_dq32<GT, DT>>(sycl::nd_range<1>((units + WG - 1) / WG * WG, WG), [=](sycl::nd_item<1> it) {
+        const uint32_t u = (uint32_t) it.get_global_id(0);
+        if (u >= units) return;
+        // IQ2_XXS / IQ3_XXS: the run decoders above (1.3-1.9x the original kernel's speed on those formats); every other
+        // format: the original run decoder (dq_run: the same as iq_dequant_expert_f16), only the launch shape differs
+        const int il = (int) (u & 3);
+        if (u < gu_units) {
+            const uint32_t vr = u / RUNS_ROW, rr = u % RUNS_ROW;   // run rr of virtual row vr
+            const uint8_t* base = (vr & 1) ? up : gate;
+            const uint32_t ibs = (vr >> 1) * (NE / 256) + rr / 32, tid = rr % 32;
+            half* yy = ygu + (size_t) vr * NE + (rr / 32) * 256;
+            if constexpr (GT == 16 || GT == 18) {
+                float v[8];
+                dq_run_fast<GT>(base, ibs, (int) (tid >> 2), il, v);
+                sycl::vec<half, 8> hv;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) hv[j] = half(v[j]);
+                *reinterpret_cast<sycl::vec<half, 8>*>(yy + 8 * tid) = hv;
+            } else {
+                dq_run<GT>(base, ibs, yy, (int) tid);
+            }
+        } else {
+            const uint32_t r = u - gu_units, flat = r * 8;
+            dq_run<DT>(down, flat >> 8, yd + (flat & ~255u), (int) ((flat & 255) >> 3));
+        }
+    });
+}
+template <int GT>
+bool dq32_by_dt(sycl::queue& q, int dt, const uint8_t* g, const uint8_t* u, const uint8_t* d, int64_t n_ff, int64_t n_embd,
+                half* ygu, half* yd) {
+    if (dt == 42) { dq32_launch<GT, 42>(q, g, u, d, n_ff, n_embd, ygu, yd); return true; }
+    if (dt == 20) { dq32_launch<GT, 20>(q, g, u, d, n_ff, n_embd, ygu, yd); return true; }
+    return false;
+}
+}  // namespace nightg
+
+static int g_night_dq32 = -1;   // -1: the environment
+void night_dq32_override(int on) { g_night_dq32 = on; }
+bool night_dq32_on() {
+    static const bool env = [] {
+        const char* e = std::getenv("STRATA_NIGHT_PREFILL_DQ32");
+        const bool on = e && e[0] == '1';
+        if (on) std::fprintf(stderr, "strata: STRATA_NIGHT_PREFILL_DQ32=1: the prompt experts' FP16 dequant takes one work-item "
+                                     "per 32-value sub-block (the same values; night lab)\n");
+        return on;
+    }();
+    return g_night_dq32 >= 0 ? g_night_dq32 != 0 : env;
+}
+bool night_dequant_expert_f16(int gt, int dt, const void* gate, const void* up, const void* down, int64_t n_ff,
+                              int64_t n_embd, uint16_t* dst_gu, uint16_t* dst_d, void* stream) {
+    if (n_embd != 2560 || n_ff != 640) return false;   // the kernel's constants (this model's expert shape)
+    sycl::queue& q = *strata::q_of(stream);
+    const auto *g = (const uint8_t*) gate, *u = (const uint8_t*) up, *d = (const uint8_t*) down;
+    auto* ygu = reinterpret_cast<sycl::half*>(dst_gu);
+    auto* yd = reinterpret_cast<sycl::half*>(dst_d);
+    switch (gt) {
+        case 16: return nightg::dq32_by_dt<16>(q, dt, g, u, d, n_ff, n_embd, ygu, yd);
+        case 17: return nightg::dq32_by_dt<17>(q, dt, g, u, d, n_ff, n_embd, ygu, yd);
+        case 18: return nightg::dq32_by_dt<18>(q, dt, g, u, d, n_ff, n_embd, ygu, yd);
+        case 21: return nightg::dq32_by_dt<21>(q, dt, g, u, d, n_ff, n_embd, ygu, yd);
+        case 22: return nightg::dq32_by_dt<22>(q, dt, g, u, d, n_ff, n_embd, ygu, yd);
+        default: return false;
+    }
+}
+
 bool night_grouped_f16(int ty, bool gu, const NightGroupedEntry* ent, int n_ent, int mt, const uint16_t* X, float* Y,
                        int N, int K, size_t up_off, void* stream) {
     if (n_ent <= 0) return true;

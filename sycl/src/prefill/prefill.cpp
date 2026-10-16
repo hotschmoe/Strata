@@ -337,6 +337,12 @@ inline bool night_halves() {
                                     "each chunk runs as two halves interleaved per layer (the two cards overlap)");
     return v;
 }
+// STRATA_NIGHT_PREFILL_DQCACHE=1 (with HALVES): each layer's dense weights are dequantized once for both halves
+inline bool night_dqcache() {
+    static const bool v = night_env("STRATA_NIGHT_PREFILL_DQCACHE",
+                                    "under HALVES each layer's dense weights are dequantized once for both halves (bitwise)");
+    return v;
+}
 inline bool night_grouped() {
     static const bool v = night_env("STRATA_NIGHT_PREFILL_GROUPED",
                                     "card 1's small experts run through one grouped decode + XMX launch per projection");
@@ -662,6 +668,7 @@ struct PeerPrefill {
     float* hv_w_host = nullptr;
     float *hv_w = nullptr, *hv_shared = nullptr, *hv_sg = nullptr;
     sycl::queue* hv_q0 = nullptr;
+    uint16_t* hv_dqc = nullptr;   // DQCACHE buffer (card 0)
     uint32_t* hv_err0 = nullptr;   // card 0's doorbell-timeout word (card 0's context; early_err is card 1's)
     // per-half host staging of card 1's tables and of both cards' grouped-entry tables: a half's copies may still be
     // pending when the other half refills its own (no host wait on card 1 in the layer loop)
@@ -761,7 +768,7 @@ struct PeerPrefill {
     ~PeerPrefill() {
         if (ng0_ent && ng0_q) sycl::free(ng0_ent, *ng0_q);   // night lab GROUPED: the primary's table, its own queue
         if (hv_q0) {   // night lab HALVES: the primary's buffers
-            for (void* hp : {(void*) hv_w_host, (void*) hv_w, (void*) hv_shared, (void*) hv_sg, (void*) hv_err0}) if (hp) sycl::free(hp, *hv_q0);
+            for (void* hp : {(void*) hv_w_host, (void*) hv_w, (void*) hv_shared, (void*) hv_sg, (void*) hv_err0, (void*) hv_dqc}) if (hp) sycl::free(hp, *hv_q0);
         }
         if (dev < 0) return;
         int prev = 0;
@@ -2051,6 +2058,12 @@ bool Prefill::set_ep_peer(int device, core::ExpertCache* cache, std::string& err
             pp->hv_shared = sycl::malloc_device<float>(TM * N, *pp->hv_q0);
             pp->hv_sg = sycl::malloc_device<float>(TM, *pp->hv_q0);
             pp->hv_err0 = sycl::malloc_host<uint32_t>(1, *pp->hv_q0);
+            if (night_dqcache()) {   // one layer's dense weights in FP16 (GDN 62.5M, QSA 54.7M values)
+                const size_t elems = (size_t) 66 << 20;
+                pp->hv_dqc = sycl::malloc_device<uint16_t>(elems, *pp->hv_q0);
+                if (pp->hv_dqc) m.gemm.dqc_attach(pp->hv_dqc, elems);
+                else std::fprintf(stderr, "strata prefill: STRATA_NIGHT_PREFILL_DQCACHE: 132 MB do not fit on card 0 - off\n");
+            }
             ok = pp->hv_w_host && pp->hv_w && pp->hv_shared && pp->hv_sg && pp->hv_err0;
             if (ok) {
                 *pp->hv_err0 = 0;
@@ -3132,6 +3145,10 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
             const int32_t* steps_host_p = m.steps_host.data() + hv_t0 * strata::kernels::kStepCount;
             const int64_t hv_ldx = hc_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) && !gr_unfused() && !m.xn16_lo ? D + XN_PAD : D;
             HalfView hview(m, sub >= 0 ? hv_t0 : 0, hv_ldx, sub >= 0);
+            // DQCACHE: the first half's stage 1 fills the layer's entries, the second half's reuses them
+            if (sub == 0 && stage == 1) m.gemm.dqc_reset();
+            m.gemm.dqc_enable(stage == 1);
+            struct DqcOff { Gemm& g; ~DqcOff() { g.dqc_enable(false); } } dqc_off{m.gemm};
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk

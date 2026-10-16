@@ -10,6 +10,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 
 #include <cstdio>
+#include <type_traits>
 #include <cstdlib>
 
 namespace strata::kernels {
@@ -216,6 +217,50 @@ bool geometry(int type, int& block_elems, int& block_bytes) {
     }
 }
 
+// night lab STRATA_NIGHT_PREFILL_DDQ=1: the FP16 dense dequant with coalesced stores.  Each work-item still decodes one
+// 32-value group (group32, the same values), into local memory; the work-group then writes its groups out 16 bytes
+// per lane, consecutive lanes on consecutive bytes (the scalar 2-byte stores reached 93-151 GB/s).
+bool night_ddq_on() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_NIGHT_PREFILL_DDQ");
+        const bool on = e && e[0] == '1';
+        if (on) std::fprintf(stderr, "strata: STRATA_NIGHT_PREFILL_DDQ=1: the dense FP16 dequant stores through local memory "
+                                     "(coalesced; the same values; night lab)\n");
+        return on;
+    }();
+    return v;
+}
+int g_night_ddq = -1;
+template <int TY> class k_night_ddq;
+template <int TY>
+void night_ddq_launch(const uint8_t* p, int64_t row_bytes, int64_t row0, int64_t rows, int64_t gpr, int64_t ld, H16* out,
+                      sycl::queue& q) {
+    constexpr int WG = 256;
+    const int64_t total = rows * gpr;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<H16, 1> st(WG * 32, h);
+        h.parallel_for<k_night_ddq<TY>>(sycl::nd_range<1>((size_t) ((total + WG - 1) / WG) * WG, WG), [=](sycl::nd_item<1> it) {
+            const int lid = (int) it.get_local_id(0);
+            const int64_t g0 = (int64_t) it.get_group(0) * WG, g = g0 + lid;
+            H16* mine = st.template get_multi_ptr<sycl::access::decorated::no>().get() + lid * 32;
+            if (g < total) {
+                const int64_t r = g / gpr, gi = g % gpr;
+                group32<TY>(p + (row0 + r) * row_bytes, (int) gi, mine);
+            }
+            sycl::group_barrier(it.get_group());
+            const H16* sb = st.template get_multi_ptr<sycl::access::decorated::no>().get();
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const int idx = c * WG + lid, gl = idx >> 2, part = idx & 3;   // group gl's 8-value part
+                const int64_t gg = g0 + gl;
+                if (gg >= total) continue;
+                const int64_t r = gg / gpr, gi = gg % gpr;
+                const sycl::vec<uint16_t, 8> v = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(sb + gl * 32 + part * 8);
+                *reinterpret_cast<sycl::vec<uint16_t, 8>*>(out + r * ld + gi * 32 + part * 8) = v;
+            }
+        });
+    });
+}
 template <typename T>
 void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, T* out, void* stream,
             int64_t ld = 0) {
@@ -230,6 +275,25 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     const unsigned grid = (unsigned) ((total + 255) / 256);
     const uint8_t* p = (const uint8_t*) blocks;
     dpct::queue_ptr st = strata::q_of(stream);
+    if constexpr (std::is_same_v<T, H16>) {   // night lab DDQ (16-byte aligned rows only)
+        if ((g_night_ddq >= 0 ? g_night_ddq != 0 : night_ddq_on()) && ld % 8 == 0 &&
+            reinterpret_cast<uintptr_t>(out) % 16 == 0) {
+            switch (type) {
+                case 2: night_ddq_launch<2>(p, row_bytes, row0, rows, gpr, ld, out, *st); return;
+                case 6: night_ddq_launch<6>(p, row_bytes, row0, rows, gpr, ld, out, *st); return;
+                case 7: night_ddq_launch<7>(p, row_bytes, row0, rows, gpr, ld, out, *st); return;
+                case 8: night_ddq_launch<8>(p, row_bytes, row0, rows, gpr, ld, out, *st); return;
+                case 11: night_ddq_launch<11>(p, row_bytes, row0, rows, gpr, ld, out, *st); return;
+                case 12: night_ddq_launch<12>(p, row_bytes, row0, rows, gpr, ld, out, *st); return;
+                case 13: night_ddq_launch<13>(p, row_bytes, row0, rows, gpr, ld, out, *st); return;
+                case 14: night_ddq_launch<14>(p, row_bytes, row0, rows, gpr, ld, out, *st); return;
+                case 20: night_ddq_launch<20>(p, row_bytes, row0, rows, gpr, ld, out, *st); return;
+                case 23: night_ddq_launch<23>(p, row_bytes, row0, rows, gpr, ld, out, *st); return;
+                case 42: night_ddq_launch<42>(p, row_bytes, row0, rows, gpr, ld, out, *st); return;
+                default: break;
+            }
+        }
+    }
 #define STRATA_DQ(TY)                                                          \
     {                                                                          \
         auto exp_props = sycl::ext::oneapi::experimental::properties{          \
@@ -284,6 +348,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
 
 }  // namespace
 
+void night_ddq_override(int on) { g_night_ddq = on; }
 bool dequant_bf16_supported(int ggml_type) noexcept {
     int a, b;
     return geometry(ggml_type, a, b);

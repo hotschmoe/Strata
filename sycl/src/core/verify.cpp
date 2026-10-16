@@ -3233,6 +3233,12 @@ catch (sycl::exception const &exc) {
 
 bool Verifier::capture_batch(const int *rows, int S, int hbase,
                              std::string &err) try {
+    if (S > (int) (sizeof(brow_) / sizeof(brow_[0]))) {   // night T12 guard
+        std::fprintf(stderr, "strata night T12: capture_batch with %d rows exceeds brow_ (%d)\n", S,
+                     (int) (sizeof(brow_) / sizeof(brow_[0])));
+        err = "verify: batch window wider than the host row arrays";
+        return false;
+    }
     dpct::experimental::command_graph_exec_ptr &ex =
         exec_bm_[bkey(rows, S, hbase)];
     if (ex != nullptr) return true;
@@ -3519,6 +3525,15 @@ bool Verifier::stage_batch(const int *rows, int S, int hbase,
                            std::string &err) try {
     using namespace strata::kernels;
     host_boundary::mark("stage_enter", S, hbase);
+    // night T12 guard: the per-row host arrays (brow_, last_rows_, last_tokens_, last_pos_b_, b_out_, ple_rows) hold
+    // kVerifyCapT rows
+    if (S > strata::kernels::kVerifyCapT || S > (int) (sizeof(last_rows_) / sizeof(last_rows_[0])) ||
+        S > (int) (sizeof(brow_) / sizeof(brow_[0]))) {
+        std::fprintf(stderr, "strata night T12: stage_batch with %d rows exceeds the host row arrays (%d)\n", S,
+                     (int) (sizeof(last_rows_) / sizeof(last_rows_[0])));
+        err = "verify: batch window wider than the host row arrays";
+        return false;
+    }
     if (S < 1 || S > max_t_ || hbase < 0 ||
         (next_ != nullptr && hbase + S > (int) slots_.size())) {
         err = "verify: batch rows out of range (init_slots)";

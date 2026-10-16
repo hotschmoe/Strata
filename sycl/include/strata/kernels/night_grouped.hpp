@@ -23,6 +23,13 @@ struct NightGroupedEntry {
 /// `ent` is device memory (n_ent entries).  Returns false (nothing launched) for an unsupported type / shape.
 bool night_grouped_f16(int ty, bool gu, const NightGroupedEntry* ent, int n_ent, int mt, const uint16_t* X, float* Y,
                        int N, int K, size_t up_off, void* stream);
+/// STRATA_NIGHT_PREFILL_DQ32: iq_dequant_expert_f16's values and layout from one work-item per 32-value sub-block;
+/// false (nothing launched) for a type pair it does not cover.  night_dq32_on() = the flag (night_dq32_override(0/1)
+/// forces it for the parity probe; -1 back to the environment).
+bool night_dequant_expert_f16(int gu_type, int d_type, const void* gate, const void* up, const void* down, int64_t n_ff,
+                              int64_t n_embd, uint16_t* dst_gu, uint16_t* dst_d, void* stream);
+bool night_dq32_on();
+void night_dq32_override(int on);
 /// The entry row cap for mt.
 constexpr int night_grouped_rows(int mt) { return 8 * mt; }
 

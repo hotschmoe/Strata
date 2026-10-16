@@ -18,6 +18,8 @@ void dequant_bf16(int ggml_type, const void* blocks, int64_t row0, int64_t rows,
                   void* stream);
 
 /// The same into FP16 bits (the prompt path's quantized-weight GEMMs: Q2_0 values are exact in FP16).
+/// Night lab: force STRATA_NIGHT_PREFILL_DDQ (the coalesced-store FP16 dense dequant) on (1) / off (0) / env (-1).
+void night_ddq_override(int on);
 void dequant_f16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,
                  void* stream);
 
