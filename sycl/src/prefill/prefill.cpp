@@ -331,10 +331,56 @@ inline bool night_early() {
 //   experts with <= STRATA_NIGHT_PREFILL_GROUPED_MAX rows (default 64) go first in its row order and run through
 //   night_grouped_f16 (IQ decode + joint_matrix in one launch per projection and row-tile size), a single SwiGLU per
 //   batch; the larger ones keep dequant + oneMKL.  FP32 accumulation order changes (rounding level).
+// STRATA_NIGHT_PREFILL_HALVES=1 (expert parallel, IPC, STRATA_EP_PREFILL_REDUCE=1): see layer_step in run_impl.
+inline bool night_halves() {
+    static const bool v = night_env("STRATA_NIGHT_PREFILL_HALVES",
+                                    "each chunk runs as two halves interleaved per layer (the two cards overlap)");
+    return v;
+}
 inline bool night_grouped() {
     static const bool v = night_env("STRATA_NIGHT_PREFILL_GROUPED",
                                     "card 1's small experts run through one grouped decode + XMX launch per projection");
     return v;
+}
+// STRATA_NIGHT_PREFILL_GROUPED_CARDS: 3 both (default), 1 card 1 only, 2 card 0 only (narrowing)
+inline int night_grouped_cards() {
+    static const int v = [] { const char* e = std::getenv("STRATA_NIGHT_PREFILL_GROUPED_CARDS"); return e ? std::atoi(e) : 3; }();
+    return v;
+}
+// STRATA_NIGHT_PREFILL_GROUPED_CHECK=1 (debug, slow: host syncs): every layer, the grouped small experts are computed
+// again on the per-expert reference path and compared; one stderr line per layer and card
+inline bool night_grouped_check() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_NIGHT_PREFILL_GROUPED_CHECK");
+        const bool on = e && e[0] == '1';
+        if (on) std::fprintf(stderr, "strata prefill: STRATA_NIGHT_PREFILL_GROUPED_CHECK=1: grouped experts re-run on the reference path and compared\n");
+        return on;
+    }();
+    return v;
+}
+// compare grouped (a) vs reference (b) rows of the small experts; one line
+inline void night_grouped_report(const char* card, int64_t layer, int64_t p0, const std::vector<float>& a, const std::vector<float>& b,
+                                 const std::vector<std::pair<int32_t, std::pair<int64_t, int32_t>>>& ex, int64_t width, int gt, int dt) {
+    double mx = 0, em = 0, s2 = 0, d2 = 0;
+    size_t nf = 0;
+    int32_t worst_e = -1; int64_t worst_rows = 0; double worst = 0;
+    for (const auto& x : ex) {
+        const int64_t o = x.second.first, ne = x.second.second;
+        double e2 = 0, r2 = 0;
+        for (int64_t i = o * width; i < (o + ne) * width; ++i) {
+            if (!std::isfinite(a[(size_t) i]) || !std::isfinite(b[(size_t) i])) { ++nf; continue; }
+            const double d = std::fabs((double) a[(size_t) i] - b[(size_t) i]);
+            em = std::max(em, d); mx = std::max(mx, (double) std::fabs(b[(size_t) i]));
+            e2 += d * d; r2 += (double) b[(size_t) i] * b[(size_t) i];
+        }
+        s2 += r2; d2 += e2;
+        const double rr = std::sqrt(e2 / std::max(r2, 1e-30));
+        if (rr > worst) { worst = rr; worst_e = x.first; worst_rows = ne; }
+    }
+    std::fprintf(stderr, "strata prefill GROUPED_CHECK: %s chunk@%lld layer %lld (gu %d, down %d): %zu experts, max abs %.3e (max |ref| %.3e), "
+                         "rms rel %.3e, worst expert %d (%lld rows) rms rel %.3e, non-finite %zu%s\n",
+                 card, (long long) p0, (long long) layer, gt, dt, ex.size(), em, mx, std::sqrt(d2 / std::max(s2, 1e-30)),
+                 worst_e, (long long) worst_rows, worst, nf, std::sqrt(d2 / std::max(s2, 1e-30)) > 1e-3 ? "  <-- BAD" : "");
 }
 inline int night_grouped_max() {
     static const int v = [] {
@@ -605,9 +651,31 @@ struct PeerPrefill {
     std::vector<strata::kernels::NightGroupedEntry> ng_host;
     size_t ng_cap = 0;
     int64_t ng_experts = 0, ng_launches = 0;
+    // night lab HALVES: per half the routed-ids event (card 0), its push epoch, its sum epoch; card 0's sum doorbell
+    // (owned by card 0, written by card 1) and card 1's group counter for it; the weights in mapped host memory; the
+    // buffers a half carries from stage 1 to stage 2 on card 0 (its routing weights, shared expert rows and gate)
+    bool hv_ok = false;
+    sycl::event hv_routed[2];
+    uint32_t hv_push_epoch[2] = {}, hv_sum_epoch[2] = {}, hv_sepoch = 0;
+    core::EpRegion hv_sflag_reg;
+    uint32_t* hv_done = nullptr;
+    float* hv_w_host = nullptr;
+    float *hv_w = nullptr, *hv_shared = nullptr, *hv_sg = nullptr;
+    sycl::queue* hv_q0 = nullptr;
+    uint32_t* hv_err0 = nullptr;   // card 0's doorbell-timeout word (card 0's context; early_err is card 1's)
+    // per-half host staging of card 1's tables and of both cards' grouped-entry tables: a half's copies may still be
+    // pending when the other half refills its own (no host wait on card 1 in the layer loop)
+    std::vector<int32_t> hv_src_ipc[2], hv_slot_host[2];
+    std::vector<float> hv_w_vec[2];
+    std::vector<strata::kernels::NightGroupedEntry> hv_ng_host[2], hv_ng0_host[2];
     strata::kernels::NightGroupedEntry* ng0_ent = nullptr;   // on the primary: its own small experts' tables
     std::vector<strata::kernels::NightGroupedEntry> ng0_host;
     sycl::queue* ng0_q = nullptr;
+    // GROUPED_CHECK scratch (debug; never freed)
+    uint16_t* chk_x = nullptr;
+    float* chk_y = nullptr;
+    float *chk0_y = nullptr, *chk0_gu = nullptr;
+    uint16_t* chk0_h = nullptr;
     int32_t* reduce_slot = nullptr;
     float* reduce_weight = nullptr;
     std::vector<int32_t> reduce_slot_host;
@@ -692,6 +760,9 @@ struct PeerPrefill {
     int64_t layers = 0, experts = 0, rows = 0, over_cap = 0;   // stats
     ~PeerPrefill() {
         if (ng0_ent && ng0_q) sycl::free(ng0_ent, *ng0_q);   // night lab GROUPED: the primary's table, its own queue
+        if (hv_q0) {   // night lab HALVES: the primary's buffers
+            for (void* hp : {(void*) hv_w_host, (void*) hv_w, (void*) hv_shared, (void*) hv_sg, (void*) hv_err0}) if (hp) sycl::free(hp, *hv_q0);
+        }
         if (dev < 0) return;
         int prev = 0;
         prev = dpct::get_current_device_id();
@@ -707,6 +778,7 @@ struct PeerPrefill {
         core::ep_region_free(rows_reg);
         core::ep_region_free(sum_reg);
         core::ep_region_free(flag_reg);   // night lab EARLY
+        core::ep_region_free(hv_sflag_reg);   // night lab HALVES
         if (early_err) sycl::free(early_err, *s);
         for (void *p : owned)
             DPCT_CHECK_ERROR(sycl::free(p, dpct::get_in_order_queue()));
@@ -1959,14 +2031,36 @@ bool Prefill::set_ep_peer(int device, core::ExpertCache* cache, std::string& err
     if (ok && pp->reduce_rows)
         ok = core::ep_region_alloc(pp->reduce_push ? primary : device, pp->reduce_push ? device : primary,
                                    (size_t) m.T_max * N * 4, pp->sum_reg, err);
-    if (ok && night_early() && (m.T_max * N) % 8 == 0) {
+    const bool hv_want = night_halves() && pp->reduce_rows && (m.T_max * N) % 16 == 0;
+    if (ok && (night_early() || hv_want) && (m.T_max * N) % 8 == 0) {
         ok = core::ep_region_alloc(device, primary, 4096, pp->flag_reg, err);
         if (ok) {   // the primary's group counter: a small allocation of its own, zeroed
             pp->push_done = sycl::malloc_device<uint32_t>(16, dpct::get_in_order_queue());
             ok = pp->push_done != nullptr;
             if (ok) dpct::get_in_order_queue().memset(pp->push_done, 0, 64).wait();
         }
-        pp->early = ok;
+        pp->early = ok && night_early();
+    }
+    if (ok && hv_want) {   // night lab HALVES: card 0's sum doorbell and the buffers on the primary
+        ok = core::ep_region_alloc(primary, device, 4096, pp->hv_sflag_reg, err);
+        if (ok) {
+            pp->hv_q0 = &dpct::get_in_order_queue();
+            const size_t TM = (size_t) m.T_max;
+            pp->hv_w_host = sycl::malloc_host<float>(TM * K, *pp->hv_q0);
+            pp->hv_w = sycl::malloc_device<float>(TM * K, *pp->hv_q0);
+            pp->hv_shared = sycl::malloc_device<float>(TM * N, *pp->hv_q0);
+            pp->hv_sg = sycl::malloc_device<float>(TM, *pp->hv_q0);
+            pp->hv_err0 = sycl::malloc_host<uint32_t>(1, *pp->hv_q0);
+            ok = pp->hv_w_host && pp->hv_w && pp->hv_shared && pp->hv_sg && pp->hv_err0;
+            if (ok) {
+                *pp->hv_err0 = 0;
+                for (int h = 0; h < 2; ++h) {   // reserved once: an assign never reallocates under a pending copy
+                    pp->hv_src_ipc[h].reserve(TM * K); pp->hv_slot_host[h].resize(TM * K); pp->hv_w_vec[h].resize(TM * K);
+                    pp->hv_ng_host[h].reserve((size_t) 2 * 512 * 16); pp->hv_ng0_host[h].reserve((size_t) 2 * 512 * 16);
+                }
+            }
+        }
+        if (!ok && err.empty()) err = "prefill (STRATA_NIGHT_PREFILL_HALVES): buffers on card 0";
     }
     if (ok && pp->reduce_rows && night_f16sum()) pp->f16sum = true;
     if (ok && night_grouped()) {   // night lab GROUPED: the primary's own small experts (2 tables x 512 x 16 tiles)
@@ -2010,7 +2104,11 @@ bool Prefill::set_ep_peer(int device, core::ExpertCache* cache, std::string& err
         std::fprintf(stderr, "strata prefill: EP row reduction enabled: one FP32 row per token returns; "
                              "FP32 addition order changes (STRATA_EP_PREFILL_REDUCE=1)\n");
     }
-    if (ok && pp->early) {
+    if (ok && hv_want && pp->flag_reg.local && pp->hv_sflag_reg.local) {   // night lab HALVES: card 1's counter
+        pp->hv_done = (uint32_t*) take(64);
+        if (ok) { pp->s->memset(pp->hv_done, 0, 64).wait(); pp->hv_ok = true; }
+    }
+    if (ok && (pp->early || pp->hv_ok)) {
         pp->early_err = sycl::malloc_host<uint32_t>(1, *pp->s);
         ok = pp->early_err != nullptr;
         if (ok) *pp->early_err = 0;
@@ -2295,6 +2393,37 @@ struct PeTimer {
     }
 };
 }  // namespace
+
+// night lab HALVES: the chunk's token-indexed buffers seen as one half (rows from t0), and the buffers a half carries
+// from stage 1 to stage 2 (routing weights, shared expert rows and gate: they live in the scratch region the next
+// half's attention reuses) moved to their own rows.  Restored when the step ends.
+struct HalfView {
+    Prefill::Impl& m;
+    bool on;
+    float *R, *xn, *lo, *gated, *inj, *grs, *mixed, *bo, *emb, *ple_emb, *w, *shared, *sg;
+    uint16_t *xn16, *lo16, *mixed_bf, *mixed_h, *xn16_lo, *lo16_lo, *mixed_bf_lo;
+    int32_t *steps_dev, *grp_host, *grp_dev;
+    HalfView(Prefill::Impl& mm, int64_t t0, int64_t ldx, bool on_) : m(mm), on(on_) {
+        if (!on) return;
+        R = m.R; xn = m.xn; lo = m.lo; gated = m.gated; inj = m.inj; grs = m.grs; mixed = m.mixed; bo = m.bo; emb = m.emb;
+        ple_emb = m.ple_emb; w = m.w; shared = m.shared; sg = m.sg;
+        xn16 = m.xn16; lo16 = m.lo16; mixed_bf = m.mixed_bf; mixed_h = m.mixed_h; xn16_lo = m.xn16_lo; lo16_lo = m.lo16_lo;
+        mixed_bf_lo = m.mixed_bf_lo; steps_dev = m.steps_dev; grp_host = m.grp_host; grp_dev = m.grp_dev;
+        auto off = [&](auto*& p, int64_t stride) { if (p) p += t0 * stride; };
+        off(m.R, D); off(m.xn, D); off(m.lo, LR); off(m.gated, D); off(m.inj, HC); off(m.grs, HC); off(m.mixed, N);
+        off(m.bo, N); off(m.emb, N); off(m.ple_emb, N); off(m.xn16, ldx); off(m.lo16, LR); off(m.mixed_bf, N);
+        off(m.mixed_h, N); off(m.xn16_lo, D); off(m.lo16_lo, LR); off(m.mixed_bf_lo, N);
+        off(m.steps_dev, strata::kernels::kStepCount); off(m.grp_host, K); off(m.grp_dev, K);
+        m.w = m.pp->hv_w + t0 * K; m.shared = m.pp->hv_shared + t0 * N; m.sg = m.pp->hv_sg + t0;
+    }
+    ~HalfView() {
+        if (!on) return;
+        m.R = R; m.xn = xn; m.lo = lo; m.gated = gated; m.inj = inj; m.grs = grs; m.mixed = mixed; m.bo = bo; m.emb = emb;
+        m.ple_emb = ple_emb; m.w = w; m.shared = shared; m.sg = sg;
+        m.xn16 = xn16; m.lo16 = lo16; m.mixed_bf = mixed_bf; m.mixed_h = mixed_h; m.xn16_lo = xn16_lo; m.lo16_lo = lo16_lo;
+        m.mixed_bf_lo = mixed_bf_lo; m.steps_dev = steps_dev; m.grp_host = grp_host; m.grp_dev = grp_dev;
+    }
+};
 
 bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                        std::string &err) try {
@@ -2971,14 +3100,45 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
           std::exit(1);
         }
         };
-        for (int64_t l = LB; l < LE; ++l) {
+        // night lab HALVES (STRATA_NIGHT_PREFILL_HALVES=1): the layer body below as a step of (layer, sub-chunk, stage).
+        // sub -1 / stage 0: the whole chunk and the whole layer (the original loop).  Halves: sub 0 / 1 = the chunk's
+        // first / second half of the tokens (every token-indexed buffer offset by hv_t0 rows, T / p0 / c0 those of the half,
+        // the layer counters derived from l), stage 1 = everything up to the routed ids (HC, attention, HC, router, push),
+        // stage 2 = the rest (host routing, the two cards' experts, the combine, the HC write).  The driver runs
+        // P(l,0) P(l,1) Q(l,0) P(l+1,0) Q(l,1) P(l+1,1) ...: card 1's experts of one half run while card 0 computes the
+        // other half's attention; no host wait on card 1 (doorbells both ways).
+        const int64_t T_chunk = T, p0_chunk = p0, c0_chunk = c0;
+        int64_t& gdn_index_chunk = gdn_index;
+        int64_t& qsa_index_chunk = qsa_index;
+        bool& normed_chunk = normed;
+        bool normed_sub[2] = {false, false};
+        const bool halves = night_halves() && m.pp && m.pp->ipc() && m.pp->hv_ok && m.pp->reduce_rows && m.pp->reduce_push && T >= 256 &&
+                            LB == 0 && LE == g.n_layers && next_ == nullptr && !hand_in_ && seq.empty() && !pe.on && !mmq_plan().any &&
+                            m.grp_host != nullptr;   // the ids in mapped memory: no host block, per-half rows
+        if (night_halves() && !halves) {
+            static bool said = false;
+            if (!said) { said = true; std::fprintf(stderr, "strata prefill: STRATA_NIGHT_PREFILL_HALVES not taken for a chunk of %lld tokens (needs expert parallel, the reduction, 256+ tokens, nothing streamed)\n", (long long) T); }
+        }
+        auto layer_step = [&](const int64_t l, const int sub, const int stage) -> bool {
+            const int64_t hv_t0 = sub <= 0 ? 0 : T_chunk / 2;
+            const int64_t T = sub < 0 ? T_chunk : (sub == 0 ? T_chunk / 2 : T_chunk - T_chunk / 2);
+            const int64_t p0 = p0_chunk + hv_t0, c0 = c0_chunk + hv_t0;
+            (void) c0;
+            int64_t gdn_local = 0, qsa_local = 0;
+            if (sub >= 0) for (int64_t j = 0; j < l; ++j) (core::is_qsa_layer(g, j) ? qsa_local : gdn_local) += 1;
+            int64_t& gdn_index = sub < 0 ? gdn_index_chunk : gdn_local;
+            int64_t& qsa_index = sub < 0 ? qsa_index_chunk : qsa_local;
+            bool& normed = sub < 0 ? normed_chunk : normed_sub[sub];
+            const int32_t* steps_host_p = m.steps_host.data() + hv_t0 * strata::kernels::kStepCount;
+            const int64_t hv_ldx = hc_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) && !gr_unfused() && !m.xn16_lo ? D + XN_PAD : D;
+            HalfView hview(m, sub >= 0 ? hv_t0 : 0, hv_ldx, sub >= 0);
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
             const core::LayerView v(*m.wt, l);
-            if (l == std::max<int64_t>(LB, 1) && !ple_land()) return false;   // the PLE rows, read from layer 1 on
+            if (stage != 2 && l == std::max<int64_t>(LB, 1) && !ple_land()) return false;   // the PLE rows, read from layer 1 on
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
-            if (l == 1 && ple_on && ple_batch) {
+            if (stage != 2 && l == 1 && ple_on && ple_batch) {
                 // the whole chunk at once, in sub-batches carved from the idle scratch region: the key and value
                 // projections as GEMMs (a token at a time they re-read ~52 MB of BF16 key per token on the IQ
                 // files), the rest with the per-token kernels' arithmetic (native_ple_postops_batch)
@@ -3017,7 +3177,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
                 }
                 stats_.ms_ple += ms_since(tp);
-            } else if (l == 1 && ple_on) {
+            } else if (stage != 2 && l == 1 && ple_on) {
                 pt.mark(kPfPle, cs);
                 const auto tp = Clock::now();
                 for (int64_t t = 0; t < T; ++t) {
@@ -3032,7 +3192,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                 }
                 stats_.ms_ple += ms_since(tp);
             }
-            for (int half = 0; half < 2; ++half) {
+            for (int half = stage == 2 ? 1 : 0; half < 2; ++half) {
                 // ---- the hyper-connection read of this half
                 const char* pre = half == 0 ? "hc_attn_" : "hc_ffn_";
                 const std::string sn = std::string(pre) + "norm.weight", sd = std::string(pre) + "down.weight",
@@ -3044,6 +3204,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                 // the xn16 token stride of this chunk (the writers of both halves and of the fused write-backs use it)
                 const int64_t ldx = hc_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) && !gr_unfused() &&
                                             !m.xn16_lo ? D + XN_PAD : D;
+                if (stage != 2) {   // night lab HALVES: stage 2 resumes after the routed ids
                 if (gr_unfused()) gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo);
                 else if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, m.cs, m.xn16_lo, ldx);
                 normed = false;
@@ -3114,6 +3275,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
                              m.mixed_bf_lo);
                 }
+                }   // stage != 2
 
                 if (half == 0 && !core::is_qsa_layer(g, l)) {
                     // ======================= GDN =======================
@@ -3251,7 +3413,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         const int64_t nb = std::min(m.sel_batch, T - t0);
                         const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
                         // C-1: the grid reaches the batch's last query's n_bid (they rise with the position)
-                        const int64_t active = (int64_t) m.steps_host[(size_t) ((t0 + nb - 1) * strata::kernels::kStepCount +
+                        const int64_t active = (int64_t) steps_host_p[(size_t) ((t0 + nb - 1) * strata::kernels::kStepCount +
                                                                                 strata::kernels::kStepNBid)] + 1;
                         // the scores on tensor cores (3xTF32: FP32-level, not bitwise); STRATA_SELECT_OLD=1: the warp kernel
                         static const bool old_sel = std::getenv("STRATA_SELECT_OLD") != nullptr;
@@ -3280,7 +3442,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         for (int64_t t0 = 0; t0 + 16 <= T; t0 += 16) {
                             std::vector<int32_t> u;
                             for (int64_t t = t0; t < t0 + 16; ++t) {
-                                const int64_t w = m.steps_host[(size_t) (t * strata::kernels::kStepCount + strata::kernels::kStepWidth)];
+                                const int64_t w = steps_host_p[(size_t) (t * strata::kernels::kStepCount + strata::kernels::kStepWidth)];
                                 sum_w += (double) w;
                                 u.insert(u.end(), ids.begin() + t * m.cap, ids.begin() + t * m.cap + w);
                             }
@@ -3345,7 +3507,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         m.cs->memcpy(b.data(), ids16, b.size() * 4);
                         m.cs->wait();
                         for (int64_t t = 0; t < T; ++t) {
-                            const int64_t w = m.steps_host[(size_t) (t * strata::kernels::kStepCount + strata::kernels::kStepWidth)];
+                            const int64_t w = steps_host_p[(size_t) (t * strata::kernels::kStepCount + strata::kernels::kStepWidth)];
                             const int32_t *x = a.data() + t * m.cap, *y = b.data() + t * m.cap;
                             int64_t i = 0, j = 0, c = 0;
                             while (i < w && j < w) {
@@ -3422,7 +3584,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             const bool complete_identity_pages = staged ||
                                 (st.kv_mode == 0 && st.kv_elastic < 0 && st.n_pages > 0 && st.n_slots >= st.n_pages);
                             const bool value_domain = complete_identity_pages && st.kv_int8 && nb == 32 && m.cap == 2051 &&
-                                m.steps_host[(size_t) (t0 * strata::kernels::kStepCount +
+                                steps_host_p[(size_t) (t0 * strata::kernels::kStepCount +
                                                      strata::kernels::kStepWidth)] == m.cap;
                             if (value_domain)
                                 strata::kernels::qsa_prefill_attn_value_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
@@ -3439,7 +3601,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs, ld_a);
                     if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err, 0, ld_a)) return false;
                     ++qsa_index;
-                    if (!kv_prefetch_after(l + 1, qsa_index)) return false;
+                    if (sub < 0 && !kv_prefetch_after(l + 1, qsa_index)) return false;   // (halves: each step stages its own)
                 } else {
                     // ======================= MoE =======================
                     const core::WeightRef *wr = need(v, "ffn_gate_inp.weight", err),
@@ -3449,8 +3611,10 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                           *wsd = need(v, "ffn_down_shexp.weight", err);
                     if (!wr || !wgi || !wsg || !wsu || !wsd) return false;
                     pt.mark(kPfRouter, cs);
-                    if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
-                    route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
+                    if (stage != 2) {
+                        if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
+                        route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
+                    }
                     // the shared expert and its scalar gate
                     auto shared_expert = [&]() -> bool {
                         if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
@@ -3464,8 +3628,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     };
                     // night lab EARLY: the expert-parallel IPC layer queues the shared expert after the host's routing
                     // wait point instead (below); every other layer keeps it here
-                    const bool night_early_l = m.pp && m.pp->ipc() && m.pp->early;
-                    if (!night_early_l && !shared_expert()) return false;
+                    const bool night_early_l = (m.pp && m.pp->ipc() && m.pp->early) || sub >= 0;   // halves: always
+                    if (stage == 0 && !night_early_l && !shared_expert()) return false;
                     // #136: STRATA_PF_FUSED=1 - the Q2_0 pack's experts on the fused int8 kernels (moe_fused.hpp),
                     // grouped on the GPU: no host sync.  Only where every expert's place is known before the routing -
                     // the streamed walk, in which every non-resident expert of the layer comes through the ring in id
@@ -3483,7 +3647,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     const bool fused_only = mmq_plan().any && mmq_plan().fo[(size_t) l];
                     const bool fused_nat = (use_mmq || fused_only) && stream_all && no_peer && lay.native && fused::native_supported(mmq_gt, mmq_dt);
                     const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
-                    if (night_early_l && fused_l && !shared_expert()) return false;   // (EP never takes fused_l)
+                    if (stage == 0 && night_early_l && fused_l && !shared_expert()) return false;   // (EP never takes fused_l)
                     // #583 / #954: the fused layout's GU/H/Xq hold the grouping tables and the int8 rows, sized for
                     // stream_all_min() - 1 tokens of MMQ's rows, so a layer that takes MMQ or the FP16 path at the FULL
                     // chunk would write T*K rows into a (stream_all_min() - 1)*K-row buffer: an illegal access, or a kernel
@@ -3568,7 +3732,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         int32_t* ids_h = grp_mapped ? m.grp_host : m.ids_host.data();
                         int32_t* slot_h = grp_mapped ? m.grp_host + m.grp_tk : m.slot_host.data();
                         int32_t* src_h = grp_mapped ? m.grp_host + 2 * m.grp_tk : m.src_host.data();
-                        if (grp_mapped) copy_i32(m.grp_dev, m.ids, T * K, m.cs);
+                        if (stage == 2) {
+                        } else if (grp_mapped) copy_i32(m.grp_dev, m.ids, T * K, m.cs);
                         /*
                         DPCT1124: cudaMemcpyAsync is migrated to
                         asynchronous memcpy API. While the origin API might be
@@ -3578,7 +3743,23 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         */
                         else m.cs->memcpy(m.ids_host.data(), m.ids,
                                           (size_t)T * K * 4);
-                        if (night_early_l) {
+                        if (sub >= 0) {
+                            // night lab HALVES: stage 1 queues the weights (mapped host memory: no host block), the
+                            // routed-ids point, this half's push + doorbell and its shared expert, then returns; stage 2
+                            // waits for that point and goes on
+                            PeerPrefill& HP = *m.pp;
+                            if (stage == 1) {
+                                if (HP.reduce_rows) copy_i32((int32_t*) (HP.hv_w_host + hv_t0 * K), (const int32_t*) m.w, T * K, m.cs);
+                                HP.hv_routed[sub] = m.cs->ext_oneapi_submit_barrier();
+                                HP.hv_push_epoch[sub] = ++HP.epoch;
+                                strata::kernels::ep_push_signal((uint8_t*) HP.x_reg.remote + (size_t) hv_t0 * N * 2, m.mixed_h, T * N / 8,
+                                                                HP.push_done, (uint32_t*) HP.flag_reg.remote, HP.hv_push_epoch[sub], m.cs);
+                                if (!shared_expert()) return false;
+                                return true;
+                            }
+                            core::progress_at("reading the prompt (batched, halves): waiting for the routed ids at layer", l, p0);
+                            HP.hv_routed[sub].wait();
+                        } else if (night_early_l) {
                             // night lab EARLY: the host needs only the ids and weights; the push, the doorbell that
                             // tells card 1 the rows are there, and the shared expert run while the host routes
                             if (m.pp->reduce_rows)
@@ -3649,7 +3830,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         }
                         // night lab GROUPED (card 0): its own experts with <= G rows first, when every one of them is resident and
                         // the layer takes the plain FP16 path (no MMQ, no XMX modes, nothing streamed this layer)
-                        bool ng0 = night_grouped() && m.pp && m.pp->ipc() && m.pp->ng0_ent != nullptr && !use_mmq && lay.native &&
+                        bool ng0 = night_grouped() && (night_grouped_cards() & 2) && m.pp && m.pp->ipc() && m.pp->ng0_ent != nullptr && !use_mmq && lay.native &&
                                    strata::prefill::xmx::mode() == 0 && m.Xs && m.Hh && m.cache && m.host_res &&
                                    (!stream_all || seq_start[(size_t) l] == seq_start[(size_t) l + 1]);
                         for (int32_t e = 0; ng0 && e < m.g->n_expert; ++e)
@@ -3665,7 +3846,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                     }
                             // the peer's rows in order_peer's order (peer-held, then peer-streamed): its groups need them contiguous
                             // night lab GROUPED: card 1's held experts with <= G rows first (one contiguous block)
-                            const bool ng_order = !on_peer.empty() && m.pp && m.pp->ipc() && m.pp->ng_ent != nullptr;
+                            const bool ng_order = !on_peer.empty() && m.pp && m.pp->ipc() && m.pp->ng_ent != nullptr &&
+                                                  (night_grouped_cards() & 1);
                             for (int pass = ng_order ? 0 : 1; pass <= 2 && !on_peer.empty(); ++pass)
                                 for (int32_t e = 0; e < m.g->n_expert; ++e)
                                     if (on_peer[(size_t) e] == (pass == 0 ? 1 : pass) &&
@@ -3689,7 +3871,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         if (ng0)   // night lab GROUPED (card 0): as its offsets
                             std::stable_partition(order.begin(), order.end(),
                                                   [&](int32_t e) { return m.cnt[(size_t) e] <= night_grouped_max(); });
-                        if (!on_peer.empty() && m.pp && m.pp->ipc() && m.pp->ng_ent != nullptr)   // night lab GROUPED: as the offsets
+                        if (!on_peer.empty() && m.pp && m.pp->ipc() && m.pp->ng_ent != nullptr && (night_grouped_cards() & 1))   // night lab GROUPED: as the offsets
                             std::stable_partition(order_peer.begin(), order_peer.end(),
                                                   [&](int32_t e) { return m.cnt[(size_t) e] <= night_grouped_max(); });
                         for (int32_t e = 0; e < m.g->n_expert && !on_peer.empty(); ++e)   // the peer-streamed ones last:
@@ -3806,10 +3988,11 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             behavior.
                             */
                             // ipc: inbound PCIe writes do not invalidate this card's caches
-                            if (P.ipc() && P.early)   // night lab EARLY: card 0's push of this layer has landed
-                                strata::kernels::ep_wait_value((const uint32_t*) P.flag_reg.local, P.epoch, 50000000u,
-                                                               P.early_err, 1u, ps);
-                            if (P.ipc()) strata::kernels::ep_copy_uncached(P.mixed_h, P.x_reg.local, (size_t) T * N * 2, ps);
+                            if (P.ipc() && (P.early || sub >= 0))   // night lab EARLY / HALVES: card 0's push has landed
+                                strata::kernels::ep_wait_value((const uint32_t*) P.flag_reg.local, sub >= 0 ? P.hv_push_epoch[sub] : P.epoch,
+                                                               50000000u, P.early_err, 1u, ps);
+                            if (P.ipc()) strata::kernels::ep_copy_uncached(P.mixed_h, (const uint8_t*) P.x_reg.local + (size_t) hv_t0 * N * 2,
+                                                                         (size_t) T * N * 2, ps);
                             else if (P.p2p) dpct::async_dpct_memcpy(
                                 P.mixed, P.dev, m.mixed, prevd,
                                 (size_t)T * N * 4, *ps);
@@ -3817,12 +4000,18 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             P.back_at = rows_local;
                             P.back_rows = rows_peer;
                             if (P.ipc()) {
-                                P.src_ipc.assign(src_h + rows_local, src_h + rows_local + rows_peer);
-                                ps->memcpy(P.src, P.src_ipc.data(), (size_t) rows_peer * 4);
+                                // night lab HALVES: each half stages in its own host vectors (see PeerPrefill), and the
+                                // weights are copied out of card 0's mapped memory by the host first
+                                std::vector<int32_t>& src_ipc = sub >= 0 ? P.hv_src_ipc[sub] : P.src_ipc;
+                                std::vector<int32_t>& slot_stage = sub >= 0 ? P.hv_slot_host[sub] : P.reduce_slot_host;
+                                src_ipc.assign(src_h + rows_local, src_h + rows_local + rows_peer);
+                                ps->memcpy(P.src, src_ipc.data(), (size_t) rows_peer * 4);
                                 if (P.reduce_rows) {
-                                    std::copy_n(slot_h, (size_t) T * K, P.reduce_slot_host.begin());
-                                    ps->memcpy(P.reduce_slot, P.reduce_slot_host.data(), (size_t) T * K * 4);
-                                    ps->memcpy(P.reduce_weight, P.reduce_weight_host.data(), (size_t) T * K * 4);
+                                    std::copy_n(slot_h, (size_t) T * K, slot_stage.begin());
+                                    ps->memcpy(P.reduce_slot, slot_stage.data(), (size_t) T * K * 4);
+                                    if (sub >= 0) std::memcpy(P.hv_w_vec[sub].data(), P.hv_w_host + hv_t0 * K, (size_t) T * K * 4);
+                                    ps->memcpy(P.reduce_weight, sub >= 0 ? P.hv_w_vec[sub].data() : P.reduce_weight_host.data(),
+                                               (size_t) T * K * 4);
                                 }
                             } else if (P.p2p) {
                                 /*
@@ -3883,7 +4072,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                 // night lab GROUPED: the leading run of order_peer with <= G rows goes through the grouped
                                 // kernels after the larger experts (processed first, from the highest offset, as before)
                                 size_t ng_n = 0;
-                                if (peer_alias && P.ng_ent != nullptr)
+                                if (peer_alias && P.ng_ent != nullptr && (night_grouped_cards() & 1))
                                     while (ng_n < n && m.cnt[(size_t) order_peer[ng_n]] <= night_grouped_max()) ++ng_n;
                                 for (size_t j = 0; j < n - ng_n; ++j) {
                                     const int32_t e = order_peer[peer_alias ? n - 1 - j : j];
@@ -3901,6 +4090,17 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                     swiglu_interleaved(P.GUf, P.Hh, ne, ps);
                                     P.gemm->f16(P.Hh, P.dq_d, rows + o * N, ne, N, 640);
                                 }
+                                // GROUPED_CHECK: the small rows' FP16 inputs before the in-place outputs overwrite them
+                                int64_t chk_a = 0, chk_rows = 0;
+                                if (ng_n > 0 && night_grouped_check()) {
+                                    chk_a = m.off[(size_t) order_peer[0]] - rows_local;
+                                    for (size_t i = 0; i < ng_n; ++i) chk_rows += m.cnt[(size_t) order_peer[i]];
+                                    if (!P.chk_x) {
+                                        P.chk_x = sycl::malloc_device<uint16_t>((size_t) P.T_max * N, *ps);
+                                        P.chk_y = sycl::malloc_device<float>((size_t) P.T_max * N, *ps);
+                                    }
+                                    ps->memcpy(P.chk_x, alias_x + chk_a * N, (size_t) chk_rows * N * 2);
+                                }
                                 if (ng_n > 0) {
                                     // entries: each small expert cut into row tiles of 16 / 32 / 64 (by its count), grouped
                                     // by tile size inside batches of <= T_max rows (GUf / Hh capacity); gate/up table then
@@ -3908,7 +4108,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                     namespace sk = strata::kernels;
                                     struct Batch { int64_t a, rows; size_t gu[4][2]; };
                                     std::vector<Batch> batches;
-                                    P.ng_host.clear();
+                                    std::vector<sk::NightGroupedEntry>& ng_host = sub >= 0 ? P.hv_ng_host[sub] : P.ng_host;
+                                    ng_host.clear();
                                     std::vector<sk::NightGroupedEntry> dn;
                                     {
                                         size_t j = 0;
@@ -3921,7 +4122,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                             b.rows = br;
                                             for (int t = 0; t < 4; ++t) {   // row tiles of 16 / 32 / 64 / 128
                                                 const int mt = 2 << t, cap = sk::night_grouped_rows(mt);
-                                                b.gu[t][0] = P.ng_host.size();
+                                                b.gu[t][0] = ng_host.size();
                                                 for (size_t i = j; i < j1; ++i) {
                                                     const int32_t e = order_peer[i];
                                                     const int c = m.cnt[(size_t) e];
@@ -3929,20 +4130,20 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                                     const int64_t o = m.off[(size_t) e] - rows_local - b.a;
                                                     const uint8_t* bd = P.slot_ptr(l, e);
                                                     for (int r0 = 0; r0 < c; r0 += cap) {
-                                                        P.ng_host.push_back({bd, o + r0, std::min(cap, c - r0), 0});
+                                                        ng_host.push_back({bd, o + r0, std::min(cap, c - r0), 0});
                                                         dn.push_back({bd + f.down_off, o + r0, std::min(cap, c - r0), 0});
                                                     }
                                                 }
-                                                b.gu[t][1] = P.ng_host.size();
+                                                b.gu[t][1] = ng_host.size();
                                             }
                                             batches.push_back(b);
                                             j = j1;
                                         }
                                     }
-                                    const size_t ne_gu = P.ng_host.size();
+                                    const size_t ne_gu = ng_host.size();
                                     if (2 * ne_gu > P.ng_cap) { err = "prefill (STRATA_NIGHT_PREFILL_GROUPED): too many entries"; return false; }
-                                    P.ng_host.insert(P.ng_host.end(), dn.begin(), dn.end());
-                                    ps->memcpy(P.ng_ent, P.ng_host.data(), P.ng_host.size() * sizeof(sk::NightGroupedEntry));
+                                    ng_host.insert(ng_host.end(), dn.begin(), dn.end());
+                                    ps->memcpy(P.ng_ent, ng_host.data(), ng_host.size() * sizeof(sk::NightGroupedEntry));
                                     for (size_t bi = batches.size(); bi-- > 0;) {   // highest offsets first (alias in place)
                                         const Batch& b = batches[bi];
                                         for (int t = 0; t < 4; ++t) {
@@ -3966,17 +4167,40 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                         }
                                     }
                                     P.ng_experts += (int64_t) ng_n;
+                                    if (night_grouped_check() && P.chk_x && P.chk_y && chk_rows <= P.T_max) {
+                                        std::vector<std::pair<int32_t, std::pair<int64_t, int32_t>>> ex;
+                                        for (size_t i = 0; i < ng_n; ++i) {   // the reference path, per expert, from the saved inputs
+                                            const int32_t e = order_peer[i];
+                                            const int64_t o = m.off[(size_t) e] - rows_local - chk_a, ne = m.cnt[(size_t) e];
+                                            const uint8_t* bd = P.slot_ptr(l, e);
+                                            strata::kernels::iq_dequant_expert_f16(f.gu_type, f.d_type, bd, bd + f.up_off, bd + f.down_off,
+                                                                                   f.n_ff, f.n_embd, P.dq_gu, P.dq_d, ps);
+                                            P.gemm->f16(P.chk_x + o * N, P.dq_gu, P.GUf, ne, 1280, N);
+                                            swiglu_interleaved(P.GUf, P.Hh, ne, ps);
+                                            P.gemm->f16(P.Hh, P.dq_d, P.chk_y + o * N, ne, N, 640);
+                                            ex.push_back({e, {o, (int32_t) ne}});
+                                        }
+                                        std::vector<float> ga((size_t) chk_rows * N), gb((size_t) chk_rows * N);
+                                        ps->memcpy(ga.data(), rows + chk_a * N, ga.size() * 4);
+                                        ps->memcpy(gb.data(), P.chk_y, gb.size() * 4);
+                                        ps->wait();
+                                        night_grouped_report("card 1", l, p0, ga, gb, ex, N, f.gu_type, f.d_type);
+                                    }
                                 }
                                 strata::core::prefill_host::mark("peer_loop_end");
+                                // night lab HALVES: this half's rows of the sum region (FP16: rows, then the chunk's scale
+                                // column), and the last work-group raises card 0's sum doorbell
+                                uint32_t* hv_sflag = sub >= 0 ? (uint32_t*) P.hv_sflag_reg.remote : nullptr;
+                                const uint32_t hv_sval = sub >= 0 ? (P.hv_sum_epoch[sub] = ++P.hv_sepoch) : 0u;
                                 if (P.reduce_rows && P.f16sum) {   // night lab F16SUM: FP16 rows, then T scales
                                     uint8_t* sb = (uint8_t*) (P.reduce_push ? P.sum_reg.remote : P.sum_reg.local);
                                     strata::kernels::ep_prefill_reduce_h(rows, P.reduce_slot, P.reduce_weight,
-                                        (uint16_t*) sb, (float*) (sb + (size_t) T * N * 2),
-                                        T, rows_local, N, (int) K, ps, P.reduce_push);
+                                        (uint16_t*) (sb + (size_t) hv_t0 * N * 2), (float*) (sb + (size_t) T_chunk * N * 2) + hv_t0,
+                                        T, rows_local, N, (int) K, ps, P.reduce_push, P.hv_done, hv_sflag, hv_sval);
                                 } else if (P.reduce_rows)
                                     strata::kernels::ep_prefill_reduce(rows, P.reduce_slot, P.reduce_weight,
-                                        (float*) (P.reduce_push ? P.sum_reg.remote : P.sum_reg.local),
-                                        T, rows_local, N, (int) K, ps, P.reduce_push);
+                                        (float*) (P.reduce_push ? P.sum_reg.remote : P.sum_reg.local) + hv_t0 * N,
+                                        T, rows_local, N, (int) K, ps, P.reduce_push, P.hv_done, hv_sflag, hv_sval);
                             } else if (P.compact) {
                                 // groups of up to MMQ_GROUP experts and at most G rows, each computed from its own rows
                                 P.groups.clear();
@@ -4613,7 +4837,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             if (ng0_n > 0) {
                                 const auto& f = lay.fmt[(size_t) l];
                                 PeerPrefill& P0 = *m.pp;
-                                P0.ng0_host.clear();
+                                std::vector<sk::NightGroupedEntry>& ng0_host = sub >= 0 ? P0.hv_ng0_host[sub] : P0.ng0_host;
+                                ng0_host.clear();
                                 std::vector<sk::NightGroupedEntry> dn;
                                 size_t lim[5] = {0, 0, 0, 0, 0};
                                 int64_t S = 0;
@@ -4626,15 +4851,15 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                         if ((c <= 16 ? 0 : c <= 32 ? 1 : c <= 64 ? 2 : 3) != t) continue;
                                         const uint8_t* bd = m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]);
                                         for (int r0 = 0; r0 < c; r0 += cap) {
-                                            P0.ng0_host.push_back({bd, (int64_t) m.off[(size_t) e] + r0, std::min(cap, c - r0), 0});
+                                            ng0_host.push_back({bd, (int64_t) m.off[(size_t) e] + r0, std::min(cap, c - r0), 0});
                                             dn.push_back({bd + f.down_off, (int64_t) m.off[(size_t) e] + r0, std::min(cap, c - r0), 0});
                                         }
                                     }
-                                    lim[t + 1] = P0.ng0_host.size();
+                                    lim[t + 1] = ng0_host.size();
                                 }
-                                const size_t ne_gu = P0.ng0_host.size();
-                                P0.ng0_host.insert(P0.ng0_host.end(), dn.begin(), dn.end());
-                                m.cs->memcpy(P0.ng0_ent, P0.ng0_host.data(), P0.ng0_host.size() * sizeof(sk::NightGroupedEntry));
+                                const size_t ne_gu = ng0_host.size();
+                                ng0_host.insert(ng0_host.end(), dn.begin(), dn.end());
+                                m.cs->memcpy(P0.ng0_ent, ng0_host.data(), ng0_host.size() * sizeof(sk::NightGroupedEntry));
                                 pt.mark(kPfGemmGU, cs);
                                 for (int t = 0; t < 4; ++t)
                                     if (lim[t + 1] > lim[t] &&
@@ -4653,6 +4878,32 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                         return false;
                                     }
                                 stats_.experts_resident += (int64_t) ng0_n;
+                                if (night_grouped_check() && S > 0) {   // the reference path per expert into scratch, compared
+                                    if (!P0.chk0_y) {
+                                        P0.chk0_y = sycl::malloc_device<float>((size_t) m.T_max * N, *m.cs);
+                                        P0.chk0_gu = sycl::malloc_device<float>((size_t) m.T_max * 1280, *m.cs);
+                                        P0.chk0_h = sycl::malloc_device<uint16_t>((size_t) m.T_max * 640, *m.cs);
+                                    }
+                                    if (S <= m.T_max) {
+                                        std::vector<std::pair<int32_t, std::pair<int64_t, int32_t>>> ex;
+                                        for (size_t i = 0; i < ng0_n; ++i) {
+                                            const int32_t e = order[i];
+                                            const int64_t o = m.off[(size_t) e], ne = m.cnt[(size_t) e];
+                                            const uint8_t* bd = m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]);
+                                            strata::kernels::iq_dequant_expert_f16(f.gu_type, f.d_type, bd, bd + f.up_off, bd + f.down_off,
+                                                                                   f.n_ff, f.n_embd, m.dq_gu[0], m.dq_d[0], m.cs);
+                                            m.gemm.f16(m.Xs + o * N, m.dq_gu[0], P0.chk0_gu, ne, 1280, N);
+                                            swiglu_interleaved(P0.chk0_gu, P0.chk0_h, ne, m.cs);
+                                            m.gemm.f16(P0.chk0_h, m.dq_d[0], P0.chk0_y + o * N, ne, N, 640);
+                                            ex.push_back({e, {o, (int32_t) ne}});
+                                        }
+                                        std::vector<float> ga((size_t) S * N), gb((size_t) S * N);
+                                        m.cs->memcpy(ga.data(), m.Dm, ga.size() * 4);
+                                        m.cs->memcpy(gb.data(), P0.chk0_y, gb.size() * 4);
+                                        m.cs->wait();
+                                        night_grouped_report("card 0", l, p0, ga, gb, ex, N, f.gu_type, f.d_type);
+                                    }
+                                }
                             }
                         }
                         if (!stream_all) {
@@ -4731,11 +4982,14 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     pt.mark(kPfCombine, cs);
                     if (peer_now && m.pp->ipc()) {
                         // uncached: this card read the previous layer's rows from the same region
-                        {
+                        if (sub >= 0) {   // night lab HALVES: card 0 waits on the device for this half's sums
+                            strata::kernels::ep_wait_value((const uint32_t*) m.pp->hv_sflag_reg.local, m.pp->hv_sum_epoch[sub],
+                                                           50000000u, m.pp->hv_err0, 2u, m.cs);
+                        } else {
                             const core::OnDevice d(m.pp->dev);
                             m.pp->s->wait();
                         }
-                        if (m.pp->early && *m.pp->early_err != 0) {
+                        if (sub < 0 && m.pp->early && *m.pp->early_err != 0) {
                             err = "prefill (STRATA_NIGHT_PREFILL_EARLY): card 1 gave up waiting for card 0's activation push at layer " +
                                   std::to_string(l);
                             return false;
@@ -4743,7 +4997,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         if (m.pp->reduce_rows && m.pp->f16sum) {
                             // night lab F16SUM: ep_prefill_finish_h below reads the FP16 sums itself
                         } else if (m.pp->reduce_rows)
-                            strata::kernels::ep_copy_uncached(m.bo, m.pp->reduce_push ? m.pp->sum_reg.local : m.pp->sum_reg.remote,
+                            strata::kernels::ep_copy_uncached(m.bo, (const float*) (m.pp->reduce_push ? m.pp->sum_reg.local : m.pp->sum_reg.remote) + hv_t0 * N,
                                                              (size_t) T * N * 4, m.cs);
                         else
                             strata::kernels::ep_copy_uncached(m.Dm + (size_t) m.pp->back_at * N, m.pp->rows_reg.remote,
@@ -4755,8 +5009,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     }
                     if (peer_now && m.pp->ipc() && m.pp->reduce_rows && m.pp->f16sum) {
                         const uint8_t* sb = (const uint8_t*) (m.pp->reduce_push ? m.pp->sum_reg.local : m.pp->sum_reg.remote);
-                        strata::kernels::ep_prefill_finish_h(m.Dm, m.slot_dev, m.w, m.shared, m.sg, (const uint16_t*) sb,
-                                                             (const float*) (sb + (size_t) T * N * 2), m.bo,
+                        strata::kernels::ep_prefill_finish_h(m.Dm, m.slot_dev, m.w, m.shared, m.sg, (const uint16_t*) (sb + (size_t) hv_t0 * N * 2),
+                                                             (const float*) (sb + (size_t) T_chunk * N * 2) + hv_t0, m.bo,
                                                              T, m.pp->back_at, N, (int) K, m.cs);
                     } else if (peer_now && m.pp->reduce_rows)
                         strata::kernels::ep_prefill_finish(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo,
@@ -4937,6 +5191,33 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                 }
                 if (steered && !cv_fused)   // --control-vector-scaled
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
+            }
+            return true;
+        };
+        if (!halves) {
+            for (int64_t l = LB; l < LE; ++l)
+                if (!layer_step(l, -1, 0)) return false;
+        } else {
+            if (static bool said = false; !said) {
+                said = true;
+                std::fprintf(stderr, "strata prefill: STRATA_NIGHT_PREFILL_HALVES=1: each chunk runs as two halves interleaved per layer "
+                                     "(card 1's experts of one half under card 0's attention of the other; night lab)\n");
+            }
+            if (!layer_step(LB, 0, 1) || !layer_step(LB, 1, 1)) return false;
+            for (int64_t l = LB; l < LE; ++l)
+                for (int sub = 0; sub < 2; ++sub) {
+                    if (!layer_step(l, sub, 2)) return false;
+                    if (l + 1 < LE && !layer_step(l + 1, sub, 1)) return false;
+                }
+            {   // card 1 is done with the chunk before its buffers are reused
+                const core::OnDevice d(m.pp->dev);
+                m.pp->s->wait();
+            }
+            m.cs->wait();   // card 0's sum-doorbell waits of the last layers have run (and reported) too
+            if (*m.pp->early_err != 0 || *m.pp->hv_err0 != 0) {
+                err = "prefill (STRATA_NIGHT_PREFILL_HALVES): a doorbell wait gave up (card 1 code " + std::to_string(*m.pp->early_err) +
+                      ", card 0 code " + std::to_string(*m.pp->hv_err0) + ")";
+                return false;
             }
         }
         if (!ple_land()) return false;   // a stage that ends before layer 1: the rows land anyway, the next gather starts

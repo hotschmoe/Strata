@@ -53,8 +53,12 @@ void ep_copy_uncached(void* dst, const void* src, size_t bytes, void* stream);
 
 /// Opt-in prompt-only reduction: sum the peer-owned routed contributions into one row per token.
 /// slot maps original router order to grouped rows; peer rows start at local_rows. Changes FP32 addition order.
+/// Night lab (STRATA_NIGHT_PREFILL_HALVES): with `flag` set, every work-group fences its stores at system scope and the
+/// last one to count itself in `done` (this card's memory, zero between calls) resets it and stores `value` into *flag
+/// (the other card's memory): the other card's doorbell for these sums.
 void ep_prefill_reduce(const float* rows, const int32_t* slot, const float* weights, float* sum,
-                       int64_t tokens, int64_t local_rows, int64_t width, int k, void* stream, bool push = false);
+                       int64_t tokens, int64_t local_rows, int64_t width, int k, void* stream, bool push = false,
+                       uint32_t* done = nullptr, uint32_t* flag = nullptr, uint32_t value = 0);
 /// Add the primary contributions and shared expert. `out` initially holds the peer sum, then is replaced in place.
 void ep_prefill_finish(const float* rows, const int32_t* slot, const float* weights,
                        const float* shared, const float* gate, float* out,
@@ -66,7 +70,8 @@ void ep_prefill_finish(const float* rows, const int32_t* slot, const float* weig
 /// value above max * 2^-28), and 2^e is written to scale[t].  sum_h holds tokens * width halves, `width` / 4 a multiple
 /// of 160 work-items x 4 vectors (width 2560).
 void ep_prefill_reduce_h(const float* rows, const int32_t* slot, const float* weights, uint16_t* sum_h, float* scale,
-                         int64_t tokens, int64_t local_rows, int64_t width, int k, void* stream, bool push);
+                         int64_t tokens, int64_t local_rows, int64_t width, int k, void* stream, bool push,
+                         uint32_t* done = nullptr, uint32_t* flag = nullptr, uint32_t value = 0);
 /// ep_prefill_finish reading the peer sum straight from ep_prefill_reduce_h's FP16 rows (past this card's caches, as
 /// ep_copy_uncached): out = (primary sum + peer) + shared * sigmoid(gate), the order of ep_prefill_finish.
 void ep_prefill_finish_h(const float* rows, const int32_t* slot, const float* weights, const float* shared,

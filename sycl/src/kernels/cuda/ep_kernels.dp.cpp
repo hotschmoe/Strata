@@ -28,10 +28,22 @@ void ep_copy_uncached(void* dst, const void* src, size_t bytes, void* stream) {
     });
 }
 
+// the last work-group of a reduce raises the other card's doorbell (night lab HALVES; flag == nullptr: nothing)
+inline void reduce_signal(sycl::nd_item<1> it, size_t groups, uint32_t* done, uint32_t* flag, uint32_t value) {
+    using sys_rmw = sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::system>;
+    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+    sycl::group_barrier(it.get_group(), sycl::memory_scope::system);
+    if (it.get_local_id(0) == 0 && sys_rmw(*done).fetch_add(1u) == (uint32_t) groups - 1) {
+        *done = 0;
+        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+        sys_store(flag, value);
+    }
+}
 template<bool Push> class ep_prefill_reduce_kernel;
 template<bool Push>
 static void reduce_impl(const float* rows, const int32_t* slot, const float* weights, float* sum,
-                        int64_t tokens, int64_t local_rows, int64_t width, int k, void* stream) {
+                        int64_t tokens, int64_t local_rows, int64_t width, int k, void* stream,
+                        uint32_t* done, uint32_t* flag, uint32_t value) {
     constexpr size_t WG = 256;
     const size_t vectors = (size_t) tokens * (size_t) width / 4;
     const size_t groups = Push ? std::min<size_t>((vectors + WG - 1) / WG, 64) : (vectors + WG - 1) / WG;
@@ -50,12 +62,14 @@ static void reduce_impl(const float* rows, const int32_t* slot, const float* wei
                 reinterpret_cast<sycl::float4*>(sum)[i] = acc;
             }
             if constexpr (Push) sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            if (flag != nullptr) reduce_signal(it, groups, done, flag, value);
         });
 }
 void ep_prefill_reduce(const float* rows, const int32_t* slot, const float* weights, float* sum,
-                       int64_t tokens, int64_t local_rows, int64_t width, int k, void* stream, bool push) {
-    if (push) reduce_impl<true>(rows, slot, weights, sum, tokens, local_rows, width, k, stream);
-    else reduce_impl<false>(rows, slot, weights, sum, tokens, local_rows, width, k, stream);
+                       int64_t tokens, int64_t local_rows, int64_t width, int k, void* stream, bool push,
+                       uint32_t* done, uint32_t* flag, uint32_t value) {
+    if (push) reduce_impl<true>(rows, slot, weights, sum, tokens, local_rows, width, k, stream, done, flag, value);
+    else reduce_impl<false>(rows, slot, weights, sum, tokens, local_rows, width, k, stream, done, flag, value);
 }
 
 void ep_prefill_finish(const float* rows, const int32_t* slot, const float* weights,
@@ -87,7 +101,8 @@ void ep_prefill_finish(const float* rows, const int32_t* slot, const float* weig
 template<bool Push> class ep_prefill_reduce_h_kernel;
 template<bool Push>
 static void reduce_h_impl(const float* rows, const int32_t* slot, const float* weights, uint16_t* sum_h, float* scale,
-                          int64_t tokens, int64_t local_rows, int64_t width, int k, void* stream) {
+                          int64_t tokens, int64_t local_rows, int64_t width, int k, void* stream,
+                          uint32_t* done, uint32_t* flag, uint32_t value) {
     constexpr int WG = 160, V = 4;                       // 160 x 4 float4 = 2560 values per token row
     const int64_t vec_row = width / 4;
     // STRATA_NIGHT_PREFILL_F16SUM_GROUPS: the work-groups of the push (default 64, as ep_prefill_reduce's push)
@@ -133,13 +148,15 @@ static void reduce_h_impl(const float* rows, const int32_t* slot, const float* w
                 (void) vec_row;
             }
             if constexpr (Push) sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            if (flag != nullptr) reduce_signal(it, groups, done, flag, value);
         });
 }
 void ep_prefill_reduce_h(const float* rows, const int32_t* slot, const float* weights, uint16_t* sum_h, float* scale,
-                         int64_t tokens, int64_t local_rows, int64_t width, int k, void* stream, bool push) {
+                         int64_t tokens, int64_t local_rows, int64_t width, int k, void* stream, bool push,
+                         uint32_t* done, uint32_t* flag, uint32_t value) {
     if (tokens <= 0) return;
-    if (push) reduce_h_impl<true>(rows, slot, weights, sum_h, scale, tokens, local_rows, width, k, stream);
-    else reduce_h_impl<false>(rows, slot, weights, sum_h, scale, tokens, local_rows, width, k, stream);
+    if (push) reduce_h_impl<true>(rows, slot, weights, sum_h, scale, tokens, local_rows, width, k, stream, done, flag, value);
+    else reduce_h_impl<false>(rows, slot, weights, sum_h, scale, tokens, local_rows, width, k, stream, done, flag, value);
 }
 
 void ep_prefill_finish_h(const float* rows, const int32_t* slot, const float* weights, const float* shared,
