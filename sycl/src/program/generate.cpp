@@ -4137,6 +4137,7 @@ int main(int argc, char **argv) try {
     // share one two-column head call (core/mtp.hpp MtpPair).  Default off: the per-slot draft() calls exactly as before.
     // Declared after slot_mtp so it is destroyed before the drafters whose buffers its graphs bind.
     std::unique_ptr<strata::core::MtpPair> mtp_pair;
+    std::unique_ptr<strata::core::MtpPair> mtp_pair2;   // night: --batch 4 drafts slots 2,3 as a second pair
     const char* pair_head_env = std::getenv("STRATA_BATCH_MTP_PAIR_HEAD");
     const bool pair_head_on = pair_head_env != nullptr && pair_head_env[0] != '\0' && pair_head_env[0] != '0';
     // Experimental CPU PLE prefetch only; the slot's GPU PleRun remains unbound.
@@ -7564,11 +7565,18 @@ int main(int argc, char **argv) try {
             // STRATA_BATCH_MTP_PAIR_HEAD: after both binds (the pair checks the bound head).  Recommend, never force.
             if (pair_head_on) {
                 std::string pwhy;
-                if (o.batch != 2 || slot_mtp.size() != 2) {
-                    pwhy = "it needs --batch 2";
+                if (!((o.batch == 2 && slot_mtp.size() == 2) || (o.batch == 4 && slot_mtp.size() == 4))) {
+                    pwhy = "it needs --batch 2 (or 4: two pairs)";
                 } else {
                     auto pr = std::make_unique<strata::core::MtpPair>();
                     if (pr->init(slot_mtp[0].get(), slot_mtp[1].get(), pwhy)) mtp_pair = std::move(pr);
+                    if (mtp_pair != nullptr && o.batch == 4) {
+                        auto pr2 = std::make_unique<strata::core::MtpPair>();
+                        if (pr2->init(slot_mtp[2].get(), slot_mtp[3].get(), pwhy)) mtp_pair2 = std::move(pr2);
+                        else mtp_pair.reset();   // all or nothing: the deferral below assumes every slot has a pair
+                        if (mtp_pair2 != nullptr)
+                            std::fprintf(stderr, "strata night: --batch 4 drafts as two MTP pairs (slots 0,1 and 2,3)\n");
+                    }
                 }
                 if (mtp_pair != nullptr)
                     std::fprintf(stderr, "strata serve: STRATA_BATCH_MTP_PAIR_HEAD: the two slots share one two-column "
@@ -9469,7 +9477,7 @@ int main(int argc, char **argv) try {
                     }
                     strata::core::host_boundary::mark("slot_copy_end", b, G);
                     if (mtp_pair != nullptr) {   // drafted below, both at once
-                        if (n_pend >= 2) { std::printf("ERR batch MTP pair: more than two pending slots\n"); return false; }
+                        if (n_pend >= (mtp_pair2 != nullptr ? 4 : 2)) { std::printf("ERR batch MTP pair: too many pending slots\n"); return false; }
                         pend[n_pend].b = b; pend[n_pend].t = t; pend[n_pend].G = G;
                         ++n_pend;
                         continue;
@@ -9483,33 +9491,42 @@ int main(int argc, char **argv) try {
                 // touched) draft as a pair; otherwise each drafts on its own in slot order, the same call as above.
                 // A pair failure after its launches is reported like a slot failure: never drafted again.
                 // Active admission order can be 1,0; the coordinator binds slot 0,1.
-                if (n_pend == 2 && pend[0].b > pend[1].b) std::swap(pend[0], pend[1]);
-                strata::core::MtpPair::Args pa[2];
-                for (int i = 0; i < n_pend && i < 2; ++i) {
-                    const PendDraft& q = pend[i];
-                    pa[i].owner = slot_mtp[(size_t) q.b].get();
-                    pa[i].T = q.G; pa[i].tokens = outb + first[q.t]; pa[i].p = pos[first[q.t]]; pa[i].a = keep[q.b] - 1;
-                    pa[i].drafts = bs[(size_t) q.b].draft.data(); pa[i].n_drafts = &pend[i].nd;
-                }
-                std::string why = n_pend == 2 ? std::string() : "one active slot";
-                const bool paired = n_pend == 2 && mtp_pair->eligible(pa[0], pa[1], why);
-                if (paired) {
-                    ++bt_pair;
-                    strata::core::host_boundary::mark("pair_call");
-                    if (!mtp_pair->draft(pa[0], pa[1], err)) {
-                        std::printf("ERR batch MTP pair (slots %d, %d): %s\n", pend[0].b, pend[1].b, err.c_str());
-                        return false;
+                // night: with two pairs (--batch 4) each pair drafts its own two slots; a pair with one pending
+                // slot (or failing a guard) drafts that slot solo
+                std::sort(pend, pend + n_pend, [](const PendDraft& x, const PendDraft& y) { return x.b < y.b; });
+                for (int k = 0; k < (mtp_pair2 != nullptr ? 2 : 1); ++k) {
+                    strata::core::MtpPair* mp = k == 0 ? mtp_pair.get() : mtp_pair2.get();
+                    int idx[2] = {-1, -1}, m = 0;
+                    for (int i = 0; i < n_pend; ++i)
+                        if (mtp_pair2 == nullptr || pend[i].b / 2 == k) { if (m < 2) idx[m] = i; ++m; }
+                    if (m == 0) continue;
+                    strata::core::MtpPair::Args pa[2];
+                    for (int j = 0; j < m && j < 2; ++j) {
+                        const PendDraft& q = pend[idx[j]];
+                        pa[j].owner = slot_mtp[(size_t) q.b].get();
+                        pa[j].T = q.G; pa[j].tokens = outb + first[q.t]; pa[j].p = pos[first[q.t]]; pa[j].a = keep[q.b] - 1;
+                        pa[j].drafts = bs[(size_t) q.b].draft.data(); pa[j].n_drafts = &pend[idx[j]].nd;
                     }
-                    strata::core::host_boundary::mark("pair_call_return");
-                } else {
-                    ++bt_pair_solo;
-                    bt_pair_why = why;
-                    for (int i = 0; i < n_pend; ++i) {
-                        const PendDraft& q = pend[i];
-                        if (!slot_mtp[(size_t) q.b]->draft(q.G, outb + first[q.t], pos[first[q.t]], keep[q.b] - 1,
-                                                            bs[(size_t) q.b].draft.data(), err, nullptr, 0.0f, &pend[i].nd)) {
-                            std::printf("ERR batch MTP slot %d: %s\n", q.b, err.c_str());
+                    std::string why = m == 2 ? std::string() : "one active slot";
+                    const bool paired = m == 2 && mp->eligible(pa[0], pa[1], why);
+                    if (paired) {
+                        ++bt_pair;
+                        strata::core::host_boundary::mark("pair_call");
+                        if (!mp->draft(pa[0], pa[1], err)) {
+                            std::printf("ERR batch MTP pair (slots %d, %d): %s\n", pend[idx[0]].b, pend[idx[1]].b, err.c_str());
                             return false;
+                        }
+                        strata::core::host_boundary::mark("pair_call_return");
+                    } else {
+                        ++bt_pair_solo;
+                        bt_pair_why = why;
+                        for (int j = 0; j < m && j < 2; ++j) {
+                            const PendDraft& q = pend[idx[j]];
+                            if (!slot_mtp[(size_t) q.b]->draft(q.G, outb + first[q.t], pos[first[q.t]], keep[q.b] - 1,
+                                                                bs[(size_t) q.b].draft.data(), err, nullptr, 0.0f, &pend[idx[j]].nd)) {
+                                std::printf("ERR batch MTP slot %d: %s\n", q.b, err.c_str());
+                                return false;
+                            }
                         }
                     }
                 }
