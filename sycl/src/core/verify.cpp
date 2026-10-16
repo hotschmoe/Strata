@@ -32,6 +32,10 @@
 #include "strata/kernels/native_head_mmvq.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
+namespace strata::kernels {   // night STRATA_NIGHT_BF16 (native_bf16.dp.cpp): two BF16 GEMVs on the same rows in one launch
+bool night_bf16_gemv_pair(const float* x, int64_t ldx, const uint16_t* w1, float* y1, int64_t ldy1, int64_t n_out1,
+                          const uint16_t* w2, float* y2, int64_t ldy2, int64_t n_out2, int64_t n_in, int n_tok, void* stream);
+}
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/ple.hpp"
@@ -1168,7 +1172,13 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                 // window's rows each - row-wise identical arithmetic (STRATA_DEC_BATCH=0: token by token)
                 const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && !st.kv_q4;
                 if (!q8_attn) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
-                if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
+                // night STRATA_NIGHT_BF16=1: the indexer k_proj and q_proj (both BF16, both on these rows of mixed_) in one
+                // launch here; each output bitwise its own call. The q_proj call below is then skipped.
+                const bool idx_q_done = qb && strata::kernels::night_bf16_gemv_pair(
+                    mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, ID, (const uint16_t*) wiq->data,
+                    qidx_ + tb * IQ * ID, IQ * ID, IQ * ID, N, n, cs);
+                if (idx_q_done) {}
+                else if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
                 else for (int t = tb; t < te; ++t)
                     bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
                 stamp(l, 7, grp);
@@ -1317,6 +1327,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                     norm_rope(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH);
                     }
                     if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, cs);   // <Hq, Hk> = <q, k>
+                    if (!idx_q_done)
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
                                               N, IQ * ID, n, cs);
                     norm_rope(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ);

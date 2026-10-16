@@ -2678,8 +2678,11 @@ void launch_night_pf(const void* weights, const void* x_q8_1, float* y, int n_in
     constexpr int P = night_p<R, NCOLS>();
     const int tiles = (n_out + R - 1) / R;
     // one group per resident slot: 8 XVE x (8 threads at GRF128, 4 at GRF256) per Xe-core
+    // STRATA_NIGHT_MMVQ2_CAP_PCT (A/B knob for the in-engine C2 regression): persistent groups as a percentage of the
+    // resident slots (default 100); 0 = one group per tile (no persistence: the hardware dispatcher balances)
+    static const int cap_pct = [] { const char* e = std::getenv("STRATA_NIGHT_MMVQ2_CAP_PCT"); return e ? std::atoi(e) : 100; }();
     const int cap = night_xe_cores(s) * std::max(1, (GRF == 256 ? 32 : 64) / nsg);
-    const int groups = std::min(tiles, cap);
+    const int groups = cap_pct <= 0 ? tiles : std::min(tiles, std::max(1, cap * cap_pct / 100));
     s->submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> slm(sycl::range<1>(2 * nsg * P + F::kTableWords), h);
         auto k = [=](sycl::nd_item<1>) [[sycl::reqd_sub_group_size(16)]] {
