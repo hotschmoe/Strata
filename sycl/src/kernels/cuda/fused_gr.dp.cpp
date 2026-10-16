@@ -1752,6 +1752,8 @@ int env_variant() {
 // per device: the variant `fused_gr_check` chose (0 = not checked yet)
 std::atomic<int> g_variant[64];
 
+#include "fused_gr_night.inc"   // night-lab: STRATA_NIGHT_HC (default off)
+
 }  // namespace
 
 // one partials buffer per queue (the verifier's and the drafter's launches never share a queue; within a queue the
@@ -1787,6 +1789,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     m.xn = xn_scratch;
     m.T = n_tok;
     dpct::queue_ptr st = strata::q_of(stream);
+    if (night_hc::read(m, st)) return false;   // STRATA_NIGHT_HC (default off): the two-kernel read
     // STRATA_GR_V3=1: the two-kernel read above (another summation order - opt-in)
     static const bool v3 = [] { const char* v = std::getenv("STRATA_GR_V3"); return v != nullptr && std::atoi(v) != 0; }();
     static int split3[64] = {};   // per device: 0 = not decided yet, 1 / 2 = column halves S, -1 = does not fit

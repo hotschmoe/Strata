@@ -346,6 +346,23 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                         for (uint64_t i = 0; i < n; ++i) { const uint32_t u = (uint32_t) src[i] << 16; std::memcpy(&f[i], &u, 4); }
                         q8 = q8_0_of(f.data(), n);
                     }
+                    // night (STRATA_NIGHT_HC=q8): the read's own layout, the same bytes split - all int8 quants row-major
+                    // ([rows][K], 16-byte aligned rows) then the fp16 scales ([rows][K/32]); nothing else reads hc_q8
+                    static const bool night_split = [] { const char* v = std::getenv("STRATA_NIGHT_HC"); return v && std::strcmp(v, "q8") == 0; }();
+                    if (night_split) {
+                        const uint8_t* blk = (f32_inject || bf16_src) ? q8.data() : (const uint8_t*) gguf.tensor_data(tensor);
+                        const uint64_t rows = (uint64_t) ref.ne1, K = (uint64_t) ref.ne0, nb = K / 32;
+                        std::vector<uint8_t> split((size_t) bytes);
+                        uint8_t* qs = split.data();
+                        uint8_t* ds = split.data() + rows * K;
+                        for (uint64_t r = 0; r < rows; ++r)
+                            for (uint64_t b = 0; b < nb; ++b) {
+                                const uint8_t* src = blk + (r * nb + b) * 34;
+                                std::memcpy(ds + (r * nb + b) * 2, src, 2);
+                                std::memcpy(qs + r * K + b * 32, src + 2, 32);
+                            }
+                        q8.swap(split);
+                    }
                     if (DPCT_CHECK_ERROR(
                             p = (void *)strata::malloc_device_guarded(
                                 bytes, dpct::get_in_order_queue())) != 0 ||
@@ -358,7 +375,7 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                         */
                         DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
                             p,
-                            (f32_inject || bf16_src) ? (const void *)q8.data()
+                            (f32_inject || bf16_src || night_split) ? (const void *)q8.data()
                                        : gguf.tensor_data(tensor),
                             bytes).wait()) != 0) {
                         err = "native dense (STRATA_HC_Q8) upload " + tensor.name; return false;
