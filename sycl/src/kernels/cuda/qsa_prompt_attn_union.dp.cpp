@@ -18,6 +18,7 @@
 namespace strata::kernels {
 class pattn_union_build_night;    // kernel names: namespace scope
 class pattn_union_attn_night;
+class pattn_union_attn_t_night;
 namespace {
 namespace jm = sycl::ext::oneapi::experimental::matrix;
 namespace jmi = sycl::ext::intel::experimental::matrix;
@@ -27,7 +28,16 @@ constexpr int CH = 32;                                       // union cells per 
 constexpr int QS = HD, SS = CH + 1, PS = CH + 8;             // local strides (halves / floats / halves)
 constexpr int RANGE = 16384;                                 // union build: cells per local bitmap pass
 constexpr int BUILD_THREADS = 256;
-constexpr int64_t TILE_BATCH = 256;                          // tiles per (build, attention) launch pair
+// tiles per (build, attention) launch pair: STRATA_NIGHT_PATTN_TILES (64..1024, default 256; 512 is ~5% faster in mode 2
+// for ~75 MB more scratch)
+int64_t tile_batch() {
+    static const int64_t tb = [] {
+        const char* v = std::getenv("STRATA_NIGHT_PATTN_TILES");
+        int64_t x = v ? std::atoll(v) : 256;
+        return x < 64 ? (int64_t) 64 : (x > 1024 ? (int64_t) 1024 : x);
+    }();
+    return tb;
+}
 static_assert(HD == strata::core::kCompiledGeometry.head_dim &&
               G == strata::core::kCompiledGeometry.n_head / strata::core::kCompiledGeometry.n_head_kv,
               "qsa_prompt_attn_union is compiled for core/geometry.hpp");
@@ -340,6 +350,262 @@ void union_attn(const float* __restrict__ q, QsaAttnPools p, const int32_t* __re
         });
 }
 
+// ---- mode 2 (STRATA_NIGHT_PATTN_XMX=2): S^T = K Q^T. The scores come out with one ROW PER LANE (the accumulator's
+// columns are the tile's rows), so each lane holds its row's cells: the softmax needs no local copy of S and no
+// shuffles; K is staged row-major (coalesced, no transposition) and Q^T is a per-tile constant B operand. P goes
+// through local memory once (rows x cells, the A operand of O = P V); V keeps its packed B layout. 64-cell chunks.
+// Sub-group s = (row group rg = s / 2 of 16 rows, half hf = s % 2): QK over cells [32 hf, +32), PV over dims [128 hf,
+// +128); the pair exchanges the row maxima and sums through local memory.
+constexpr int CH2 = 64, RG = ROWS / 16, PS2 = CH2 + 8;
+constexpr size_t QT_H = (size_t) HD * ROWS, K2_H = (size_t) CH2 * HD, V2_H = (size_t) CH2 * HD;
+constexpr size_t SLOT2 = QT_H + K2_H + V2_H;   // halves per work-group staging slot
+struct Lay2 {
+    static constexpr size_t p = (size_t) RG * 16 * PS2 * 2;
+    static constexpr size_t x = (size_t) RG * 2 * 16 * 4;
+    static constexpr size_t al = (size_t) ROWS * 4;
+    static constexpr size_t rows = (size_t) 2 * CH2 * 8;
+    static constexpr size_t mask = (size_t) 2 * CH2 * 4;
+    static constexpr size_t bytes = p + 2 * x + 2 * al + rows + mask + 16 * 8;
+};
+
+void union_attn_t(const float* __restrict__ q, QsaAttnPools p, const int32_t* __restrict__ ulist,
+                  const int32_t* __restrict__ ucount, int64_t cap, int64_t q0, int64_t n_q, int n_kv_heads,
+                  int page_size, float scale_log2, float* __restrict__ attn, uint8_t* smem, sycl::half* gstage) {
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sg = it.get_sub_group();
+    uint8_t* at = smem;
+    auto take = [&](size_t b) { uint8_t* r = at; at += (b + 15) & ~(size_t) 15; return r; };
+    sycl::half* sP = (sycl::half*) take(Lay2::p);
+    float* xmax = (float*) take(Lay2::x);
+    float* xsum = (float*) take(Lay2::x);
+    float* xal = (float*) take(Lay2::al);
+    float* xl = (float*) take(Lay2::al);
+    long long* srow2 = (long long*) take(Lay2::rows);
+    uint32_t* smk2 = (uint32_t*) take(Lay2::mask);
+
+    const int tile = (int) it.get_group(2), kvh = (int) it.get_group(1);
+    const int t = (int) it.get_local_id(2), lane = (int) sg.get_local_id()[0], sgid = (int) sg.get_group_id()[0];
+    const int rg = sgid >> 1, hf = sgid & 1;
+    const int64_t t0 = q0 + (int64_t) tile * TQ;
+    const int n_head = n_kv_heads * G;
+    const int32_t* list = ulist + (size_t) tile * TQ * cap;
+    const int U = ucount[tile];
+    sycl::half* qt = gstage + ((size_t) tile * n_kv_heads + kvh) * SLOT2;
+    sycl::half* ks = qt + QT_H;
+    sycl::half* vs = ks + K2_H;
+    auto entry = [&](int c, long long& r, uint32_t& mk) {
+        r = -1; mk = 0u;
+        if (c < U) {
+            const uint32_t e = (uint32_t) list[c];
+            const int cell = (int) (e & 0xFFFFFFu);
+            const long long page = (long long) p.page_table[cell / page_size];
+            if (page >= 0) { r = (page * n_kv_heads + kvh) * page_size + (cell % page_size); mk = e >> 24; }
+        }
+    };
+    // Q^T packed for B (dim pairs interleaved per row): word (k/2) * ROWS + n = q[n][k], q[n][k+1]
+    for (int i = t; i < (HD / 2) * ROWS; i += THREADS) {
+        const int n = i / (HD / 2), kp2 = i % (HD / 2);
+        const int j = n / G, h = n % G;
+        sycl::float2 v(0.0f);
+        if (t0 + j < n_q) v = *reinterpret_cast<const sycl::float2*>(q + (size_t) (t0 + j) * n_head * HD + (size_t) (kvh * G + h) * HD + 2 * kp2);
+        reinterpret_cast<uint32_t*>(qt)[(size_t) kp2 * ROWS + n] = sycl::bit_cast<uint32_t>(sycl::half2(v.x(), v.y()));
+    }
+    TC O[2][8];
+#pragma unroll
+    for (int rt = 0; rt < 2; ++rt)
+#pragma unroll
+        for (int dd = 0; dd < 8; ++dd) jm::joint_matrix_fill(sg, O[rt][dd], 0.0f);
+    float m_run = -INFINITY, l_run = 0.0f;   // this lane's row 16 rg + lane
+    const int myrow = 16 * rg + lane;
+    if (t < CH2) { long long r; uint32_t mk; entry(t, r, mk); srow2[t] = r; smk2[t] = mk; }
+    it.barrier(sycl::access::fence_space::global_and_local);
+
+    for (int c0 = 0, buf = 0; c0 < U; c0 += CH2, buf ^= 1) {
+        const long long* srow = srow2 + buf * CH2;
+        const uint32_t* smk = smk2 + buf * CH2;
+        // staging: all of this thread's K and V loads issued first (raw 16-byte words + scales), then converted and
+        // stored - one memory latency per chunk instead of one per item. K row-major (16 lanes per cell row), V packed.
+        {
+            constexpr int KI = (CH2 * (HD / 16) + THREADS - 1) / THREADS;          // 6
+            constexpr int VI = ((CH2 / 2) * (HD / 16) + THREADS - 1) / THREADS;    // 3
+            sycl::vec<uint32_t, 4> kr[KI];
+            float ksc[KI];
+            sycl::vec<uint32_t, 4> vr[VI][2];
+            float vsc[VI][2];
+#pragma unroll
+            for (int a = 0; a < KI; ++a) {
+                const int i = t + a * THREADS;
+                ksc[a] = 0.0f;
+                kr[a] = sycl::vec<uint32_t, 4>(0u);
+                if (i < CH2 * (HD / 16)) {
+                    const int n = i / (HD / 16), k0 = (i % (HD / 16)) * 16;
+                    const long long r = srow[n];
+                    if (r >= 0) {
+                        kr[a] = *reinterpret_cast<const sycl::vec<uint32_t, 4>*>(p.k_q + r * HD + k0);
+                        ksc[a] = (float) sycl::bit_cast<sycl::half>(p.k_scale[r * (HD / KV_Q8_GROUP) + k0 / KV_Q8_GROUP]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int a = 0; a < VI; ++a) {
+                const int i = t + a * THREADS;
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    vsc[a][e] = 0.0f;
+                    vr[a][e] = sycl::vec<uint32_t, 4>(0u);
+                    if (i < (CH2 / 2) * (HD / 16)) {
+                        const int cp = i / (HD / 16), d0 = (i % (HD / 16)) * 16;
+                        const long long r = srow[2 * cp + e];
+                        if (r >= 0) {
+                            vr[a][e] = *reinterpret_cast<const sycl::vec<uint32_t, 4>*>(p.v_q + r * HD + d0);
+                            vsc[a][e] = (float) sycl::bit_cast<sycl::half>(p.v_scale[r * (HD / KV_Q8_GROUP) + d0 / KV_Q8_GROUP]);
+                        }
+                    }
+                }
+            }
+            auto byte = [](const sycl::vec<uint32_t, 4>& w, int u) {
+                return (float) (int8_t) ((w[u >> 2] >> (8 * (u & 3))) & 0xFFu);
+            };
+#pragma unroll
+            for (int a = 0; a < KI; ++a) {
+                const int i = t + a * THREADS;
+                if (i >= CH2 * (HD / 16)) continue;
+                const int n = i / (HD / 16), k0 = (i % (HD / 16)) * 16;
+                sycl::vec<uint32_t, 8> w;
+                const float sc = ksc[a];
+#pragma unroll
+                for (int u = 0; u < 8; ++u)
+                    w[u] = sycl::bit_cast<uint32_t>(sycl::half2(byte(kr[a], 2 * u) * sc, byte(kr[a], 2 * u + 1) * sc));
+                *reinterpret_cast<sycl::vec<uint32_t, 8>*>(ks + (size_t) n * HD + k0) = w;
+            }
+#pragma unroll
+            for (int a = 0; a < VI; ++a) {
+                const int i = t + a * THREADS;
+                if (i >= (CH2 / 2) * (HD / 16)) continue;
+                const int cp = i / (HD / 16), d0 = (i % (HD / 16)) * 16;
+                sycl::vec<uint32_t, 8> o0, o1;
+#pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    o0[u] = sycl::bit_cast<uint32_t>(sycl::half2(byte(vr[a][0], u) * vsc[a][0], byte(vr[a][1], u) * vsc[a][1]));
+                    o1[u] = sycl::bit_cast<uint32_t>(sycl::half2(byte(vr[a][0], u + 8) * vsc[a][0], byte(vr[a][1], u + 8) * vsc[a][1]));
+                }
+                uint32_t* dst = reinterpret_cast<uint32_t*>(vs) + (size_t) cp * HD + d0;
+                *reinterpret_cast<sycl::vec<uint32_t, 8>*>(dst) = o0;
+                *reinterpret_cast<sycl::vec<uint32_t, 8>*>(dst + 8) = o1;
+            }
+        }
+        it.barrier(sycl::access::fence_space::global_and_local);
+        long long nr = -1;
+        uint32_t nmk = 0u;
+        if (t < CH2) entry(c0 + CH2 + t, nr, nmk);
+        // S^T (32 cells of this half x the group's 16 rows) = K Q^T; 4 K tiles + 1 Q^T tile per k-step, double-buffered
+        TC ST[4];
+#pragma unroll
+        for (int m = 0; m < 4; ++m) jm::joint_matrix_fill(sg, ST[m], 0.0f);
+        {
+            const sycl::half* kb = ks + (size_t) (32 * hf) * HD;
+            const sycl::half* qb = qt + (size_t) (16 * rg) * 2;
+            TA Ac[4], An[4];
+            TB Bc, Bn;
+#pragma unroll
+            for (int m = 0; m < 4; ++m) jm::joint_matrix_load(sg, Ac[m], gptr(kb + (size_t) (8 * m) * HD), (size_t) HD);
+            jm::joint_matrix_load(sg, Bc, gptr(qb), (size_t) (ROWS * 2));
+#pragma unroll
+            for (int kk = 0; kk < HD / 16; kk += 2) {
+#pragma unroll
+                for (int m = 0; m < 4; ++m)
+                    jm::joint_matrix_load(sg, An[m], gptr(kb + (size_t) (8 * m) * HD + (kk + 1) * 16), (size_t) HD);
+                jm::joint_matrix_load(sg, Bn, gptr(qb + (size_t) ((kk + 1) * 8) * (ROWS * 2)), (size_t) (ROWS * 2));
+#pragma unroll
+                for (int m = 0; m < 4; ++m) jm::joint_matrix_mad(sg, ST[m], Ac[m], Bc, ST[m]);
+                if (kk + 2 < HD / 16) {
+#pragma unroll
+                    for (int m = 0; m < 4; ++m)
+                        jm::joint_matrix_load(sg, Ac[m], gptr(kb + (size_t) (8 * m) * HD + (kk + 2) * 16), (size_t) HD);
+                    jm::joint_matrix_load(sg, Bc, gptr(qb + (size_t) ((kk + 2) * 8) * (ROWS * 2)), (size_t) (ROWS * 2));
+                }
+#pragma unroll
+                for (int m = 0; m < 4; ++m) jm::joint_matrix_mad(sg, ST[m], An[m], Bn, ST[m]);
+            }
+        }
+        // online softmax, the row in the lane: element (cell row, col) of ST[m] is cell 32 hf + 8 m + row of row col
+        float mx = -INFINITY;
+#pragma unroll
+        for (int m = 0; m < 4; ++m)
+            jmi::joint_matrix_apply(sg, ST[m], [&](float& v, size_t row, size_t col) {
+                const int c = 32 * hf + 8 * m + (int) row, jq = (16 * rg + (int) col) / G;
+                const bool ok = (smk[c] >> jq) & 1u;
+                v = ok ? v * scale_log2 : -INFINITY;
+                mx = sycl::fmax(mx, v);
+            });
+        xmax[(rg * 2 + hf) * 16 + lane] = mx;
+        it.barrier(sycl::access::fence_space::local_space);
+        const float m_new = sycl::fmax(m_run, sycl::fmax(mx, xmax[(rg * 2 + (hf ^ 1)) * 16 + lane]));
+        const float alpha = m_new == -INFINITY ? 1.0f : (m_run == -INFINITY ? 0.0f : sycl::exp2(m_run - m_new));
+        float sum = 0.0f;
+#pragma unroll
+        for (int m = 0; m < 4; ++m)
+            jmi::joint_matrix_apply(sg, ST[m], [&](float& v, size_t row, size_t col) {
+                const float e = (v == -INFINITY || m_new == -INFINITY) ? 0.0f : sycl::exp2(v - m_new);
+                sum += e;
+                sP[(size_t) (16 * rg + (int) col) * PS2 + 32 * hf + 8 * m + (int) row] = sycl::half(e);
+            });
+        xsum[(rg * 2 + hf) * 16 + lane] = sum;
+        if (hf == 0) xal[myrow] = alpha;
+        m_run = m_new;
+        const bool rescale = sycl::any_of_group(sg, alpha != 1.0f);
+        it.barrier(sycl::access::fence_space::local_space);
+        l_run = l_run * alpha + sum + xsum[(rg * 2 + (hf ^ 1)) * 16 + lane];
+        if (rescale) {
+#pragma unroll
+            for (int rt = 0; rt < 2; ++rt)
+#pragma unroll
+                for (int dd = 0; dd < 8; ++dd)
+                    jmi::joint_matrix_apply(sg, O[rt][dd], [=](float& v, size_t row, size_t) { v *= xal[16 * rg + 8 * rt + row]; });
+        }
+        // O += P V for the group's 16 rows x this half's 128 dims
+        {
+            TA Pt[2][4];
+#pragma unroll
+            for (int rt = 0; rt < 2; ++rt)
+#pragma unroll
+                for (int kq = 0; kq < 4; ++kq)
+                    jm::joint_matrix_load(sg, Pt[rt][kq], lptr(sP + (size_t) (16 * rg + 8 * rt) * PS2 + kq * 16), (size_t) PS2);
+            const sycl::half* vb = vs + (size_t) (128 * hf) * 2;
+#pragma unroll
+            for (int kq = 0; kq < 4; ++kq) {
+                TB Vc, Vn;
+                jm::joint_matrix_load(sg, Vc, gptr(vb + (size_t) (kq * 8) * (HD * 2)), (size_t) (HD * 2));
+#pragma unroll
+                for (int dd = 0; dd < 8; dd += 2) {
+                    jm::joint_matrix_load(sg, Vn, gptr(vb + (size_t) (kq * 8) * (HD * 2) + (dd + 1) * 16 * 2), (size_t) (HD * 2));
+                    jm::joint_matrix_mad(sg, O[0][dd], Pt[0][kq], Vc, O[0][dd]);
+                    jm::joint_matrix_mad(sg, O[1][dd], Pt[1][kq], Vc, O[1][dd]);
+                    if (dd + 2 < 8)
+                        jm::joint_matrix_load(sg, Vc, gptr(vb + (size_t) (kq * 8) * (HD * 2) + (dd + 2) * 16 * 2), (size_t) (HD * 2));
+                    jm::joint_matrix_mad(sg, O[0][dd + 1], Pt[0][kq], Vn, O[0][dd + 1]);
+                    jm::joint_matrix_mad(sg, O[1][dd + 1], Pt[1][kq], Vn, O[1][dd + 1]);
+                }
+            }
+        }
+        if (t < CH2) { srow2[(buf ^ 1) * CH2 + t] = nr; smk2[(buf ^ 1) * CH2 + t] = nmk; }
+        it.barrier(sycl::access::fence_space::global_and_local);
+    }
+    if (hf == 0) xl[myrow] = l_run;
+    it.barrier(sycl::access::fence_space::local_space);
+#pragma unroll
+    for (int rt = 0; rt < 2; ++rt)
+#pragma unroll
+        for (int dd = 0; dd < 8; ++dd)
+            jmi::joint_matrix_apply(sg, O[rt][dd], [=](float& v, size_t row, size_t col) {
+                const int rr = 16 * rg + 8 * rt + (int) row, j = rr / G, h = rr % G;
+                if (t0 + j < n_q) {
+                    const float l = xl[rr];
+                    attn[(size_t) (t0 + j) * n_head * HD + (size_t) (kvh * G + h) * HD + 128 * hf + 16 * dd + col] = l > 0.0f ? v / l : 0.0f;
+                }
+            });
+}
+
 struct Scratch {
     sycl::device dev;
     int32_t* ulist = nullptr;
@@ -350,15 +616,20 @@ struct Scratch {
 std::vector<Scratch>& scratches() { static std::vector<Scratch> v; return v; }
 }  // namespace
 
-bool qsa_night_pattn_xmx() {
-    static const bool on = [] {
+namespace {
+int pattn_mode() {
+    static const int m = [] {
         const char* v = std::getenv("STRATA_NIGHT_PATTN_XMX");
-        const bool e = v != nullptr && v[0] == '1' && v[1] == '\0';
-        if (e) std::fprintf(stderr, "strata night: STRATA_NIGHT_PATTN_XMX=1 (prompt QSA attention, 8-query union tiles on XMX, FP16 products)\n");
+        const int e = (v != nullptr && (v[0] == '1' || v[0] == '2') && v[1] == '\0') ? v[0] - '0' : 0;
+        if (e) std::fprintf(stderr, "strata night: STRATA_NIGHT_PATTN_XMX=%d (prompt QSA attention, 8-query union tiles on XMX, FP16 products%s)\n",
+                            e, e == 2 ? ", S^T = K Q^T, 64-cell chunks" : "");
         return e;
     }();
-    return on;
+    return m;
 }
+}  // namespace
+
+bool qsa_night_pattn_xmx() { return pattn_mode() != 0; }
 
 bool qsa_prompt_attn_union(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream) {
@@ -367,7 +638,8 @@ bool qsa_prompt_attn_union(const float* q, const QsaAttnPools& pools, const int3
         !pools.page_table || !pools.k_q || !pools.v_q || !pools.k_scale || !pools.v_scale || pools.k_q4 || pools.v_q4)
         return false;
     sycl::queue* st = strata::q_of(stream);
-    if (st->get_device().get_info<sycl::info::device::local_mem_size>() < Lay::bytes) return false;
+    const int mode = pattn_mode() == 2 ? 2 : 1;
+    if (st->get_device().get_info<sycl::info::device::local_mem_size>() < (mode == 2 ? Lay2::bytes : Lay::bytes)) return false;
     Scratch* sc = nullptr;
     for (auto& x : scratches())
         if (x.dev == st->get_device()) sc = &x;
@@ -376,9 +648,9 @@ bool qsa_prompt_attn_union(const float* q, const QsaAttnPools& pools, const int3
         st->wait();
         if (sc->ulist) sycl::free(sc->ulist, *st);
         if (sc->ucount) sycl::free(sc->ucount, *st);
-        sc->ulist = sycl::malloc_device<int32_t>((size_t) TILE_BATCH * TQ * cap, *st);
-        sc->ucount = sycl::malloc_device<int32_t>((size_t) TILE_BATCH, *st);
-        if (!sc->gstage) sc->gstage = sycl::malloc_device<sycl::half>((size_t) TILE_BATCH * 2 * 2 * CH * HD, *st);
+        sc->ulist = sycl::malloc_device<int32_t>((size_t) tile_batch() * TQ * cap, *st);
+        sc->ucount = sycl::malloc_device<int32_t>((size_t) tile_batch(), *st);
+        if (!sc->gstage) sc->gstage = sycl::malloc_device<sycl::half>((size_t) tile_batch() * 2 * SLOT2, *st);   // >= mode 1's
         sc->cap = cap;
         if (!sc->ulist || !sc->ucount || !sc->gstage) { std::fprintf(stderr, "qsa_prompt_attn_union: no scratch\n"); return false; }
     }
@@ -388,8 +660,8 @@ bool qsa_prompt_attn_union(const float* q, const QsaAttnPools& pools, const int3
     const float scale_log2 = 1.4426950408889634f / std::sqrt((float) HD);
     const int nkv = (int) s.n_head_kv, ps = (int) s.page_size;
     const int64_t n_tiles = (n_q + TQ - 1) / TQ;
-    for (int64_t b0 = 0; b0 < n_tiles; b0 += TILE_BATCH) {
-        const int64_t nt = sycl::min<int64_t>(TILE_BATCH, n_tiles - b0);
+    for (int64_t b0 = 0; b0 < n_tiles; b0 += tile_batch()) {
+        const int64_t nt = sycl::min<int64_t>(tile_batch(), n_tiles - b0);
         const int64_t q0 = b0 * TQ;
         st->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<uint32_t, 1> sm(sycl::range<1>(RANGE / 4), cgh);
@@ -399,6 +671,19 @@ bool qsa_prompt_attn_union(const float* q, const QsaAttnPools& pools, const int3
                     union_build(ids, steps, cap, q0, n_q, ulist, ucount, sm.get_multi_ptr<sycl::access::decorated::no>().get());
                 });
         });
+        if (mode == 2) {
+            st->submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<uint8_t, 1> slm(sycl::range<1>(Lay2::bytes), cgh);
+                cgh.parallel_for<pattn_union_attn_t_night>(
+                    sycl::nd_range<3>(sycl::range<3>(1, (size_t) nkv, (size_t) nt * THREADS), sycl::range<3>(1, 1, THREADS)),
+                    sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>},
+                    [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(SG)]] {
+                        union_attn_t(q, pools, ulist, ucount, cap, q0, n_q, nkv, ps, scale_log2, attn,
+                                     slm.get_multi_ptr<sycl::access::decorated::no>().get(), gstage);
+                    });
+            });
+            continue;
+        }
         st->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<uint8_t, 1> slm(sycl::range<1>(Lay::bytes), cgh);
             cgh.parallel_for<pattn_union_attn_night>(

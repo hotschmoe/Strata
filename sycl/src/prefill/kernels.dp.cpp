@@ -2762,6 +2762,8 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
 }
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream, int64_t ld16) {
+    // night-lab STRATA_NIGHT_GDN_CHUNK=1: the chunkwise (WY) form for chunks of at least 64 tokens
+    if (gdn_night_chunk() && gdn_recurrence_chunked(state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16)) return;
     // Aurora (S23): four lanes per column + the grid-stride norm, the same bits (tests/hip/gdn_rec_head.cpp);
     // STRATA_GDN_HEAD=1 (on by default on gfx1151; off with STRATA_GDN_HEAD=0 or STRATA_GDN_REC_HEADS) takes them
     // (AMD builds only; the arch defaults set STRATA_GDN_HEAD=1 on gfx1151 and leave other cards on the earlier kernels)

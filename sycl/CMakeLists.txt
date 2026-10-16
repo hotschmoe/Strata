@@ -248,7 +248,8 @@ target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_ker
 strata_resolve(_prefill src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
 add_library(strata_prefill STATIC ${_prefill}
             ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_fused_stub.cpp   # upstream's fused int8 kernels: not built here
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/xmx_moe.dp.cpp)      # A770 port: grouped XMX expert GEMM
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/xmx_moe.dp.cpp      # A770 port: grouped XMX expert GEMM
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/gdn_chunk.dp.cpp)    # night-lab: chunkwise GDN recurrence
 target_compile_options(strata_prefill PUBLIC -qmkl=sequential)
 target_link_options(strata_prefill PUBLIC -qmkl=sequential)
 target_link_libraries(strata_prefill PUBLIC strata_engine)
@@ -364,6 +365,10 @@ if(STRATA_SYCL_PARITY)
   strata_resolve(_src src/kernels/qsa_prompt_attn_parity.cpp)
   add_executable(qsa_prompt_attn_parity ${_src})
   target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels)
+  # night-lab STRATA_NIGHT_GDN_CHUNK: prompt GDN recurrence, token scan vs chunkwise (accuracy + timing)
+  strata_resolve(_src src/kernels/gdn_chunk_bench.cpp)
+  add_executable(gdn_chunk_bench ${_src})
+  target_link_libraries(gdn_chunk_bench PRIVATE strata_kernels strata_prefill)
   # night-lab STRATA_NIGHT_PATTN_XMX: prompt QSA attention, current kernels vs union-tile XMX (accuracy + timing)
   strata_resolve(_src src/kernels/qsa_pattn_bench.cpp)
   add_executable(qsa_pattn_bench ${_src})

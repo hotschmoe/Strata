@@ -69,6 +69,12 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
 void gdn_recurrence_variant(int variant, float* state, const float* h, const float* gate, const float* beta,
                             const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
                             void* stream, int64_t ld16 = 0);
+/// Night-lab STRATA_NIGHT_GDN_CHUNK=1 (latched): the recurrence in 64-token chunkwise (WY) form, FP32 (gdn_chunk.dp.cpp);
+/// the same outputs as gdn_recurrence at FP32 rounding level. False (nothing launched) for T < 64.
+bool gdn_night_chunk();
+bool gdn_recurrence_chunked(float* state, const float* h, const float* gate, const float* beta, const float* z,
+                            const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream,
+                            int64_t ld16 = 0);
 
 // ---- MoE
 /// softmax over 512, top-10 (ties to the lower id), weights renormalised over the ten (the native router).
