@@ -226,6 +226,7 @@ foreach(k IN LISTS _kernel_cu)
 endforeach()
 strata_resolve(_kernels ${_kernel_files} src/kernels/ngram.cpp src/ngram/ple_reader.cpp src/platform/direct_file.cpp)
 list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/qsa_prompt_attn_xmx.dp.cpp)   # port-only: the XMX prompt attention
+list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/qsa_prompt_attn_union.dp.cpp)   # night-lab: union-tile XMX prompt attention
 list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/ep_kernels.dp.cpp)   # port-only: expert parallelism over two cards
 add_library(strata_kernels STATIC ${_kernels})
 target_include_directories(strata_kernels PRIVATE ${STRATA_ROOT}/third_party/ggml)
@@ -363,6 +364,10 @@ if(STRATA_SYCL_PARITY)
   strata_resolve(_src src/kernels/qsa_prompt_attn_parity.cpp)
   add_executable(qsa_prompt_attn_parity ${_src})
   target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels)
+  # night-lab STRATA_NIGHT_PATTN_XMX: prompt QSA attention, current kernels vs union-tile XMX (accuracy + timing)
+  strata_resolve(_src src/kernels/qsa_pattn_bench.cpp)
+  add_executable(qsa_pattn_bench ${_src})
+  target_link_libraries(qsa_pattn_bench PRIVATE strata_kernels)
   # night-lab STRATA_NIGHT_ATTN_BATCH: verify-window QSA select/attention per row vs per slot vs one launch (bitwise + timing)
   strata_resolve(_src src/kernels/qsa_verify_batch_parity.cpp)
   add_executable(qsa_verify_batch_parity ${_src})

@@ -9,6 +9,7 @@
 #include <cstring>
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/qsa_prompt_attn_xmx.hpp"
+#include "strata/kernels/qsa_prompt_attn_union.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
@@ -2008,6 +2009,8 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         (void) cc[dev];
         // SYCL: the mma.sync kernel below is not ported (upstream's Turing/sm_80 split - `turing` - does not
         // apply); its XMX port takes the same arguments
+        // night-lab STRATA_NIGHT_PATTN_XMX=1: 8-query union tiles on XMX (INT8 K/V; false otherwise)
+        if (qsa_night_pattn_xmx() && qsa_prompt_attn_union(q, pools, ids, steps, cap, s, attn, n_q, stream)) return true;
         if (qsa_prompt_attn_xmx(q, pools, ids, steps, cap, s, attn, n_q, stream)) return true;
         return false;   // the caller takes the older kernel
     }
