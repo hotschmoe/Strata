@@ -165,14 +165,19 @@ public:
     }
 
 private:
+    friend class MtpPair;   // STRATA_BATCH_MTP_PAIR_HEAD: two slots' heads in one call (below)
     bool record_forward(int T, int step_row0, dpct::queue_ptr cs,
-                        std::string &err);
+                        std::string &err, bool head = true);
     /// The layer's front for T rows at step rows [row0, +T): the embedding, the fc projections, the attention
     /// hyper-connection read (R_, inj_, mixed_) and the K/V appended.
     bool record_front(int T, int row0, dpct::queue_ptr cs, std::string &err);
     /// The rest for row 0 at step row `step_row`: the attention from the q projection, the MLP, the final mixer,
     /// the head, the draft and its probability.  Needs row 0's R_, inj_ and mixed_ (its q8_1 rows in xq_).
-    bool record_rest(int step_row, dpct::queue_ptr cs, std::string &err);
+    /// `head` false (MtpPair): stops after the final mixer, with row 0's mixed residual in sample_ and no head.
+    bool record_rest(int step_row, dpct::queue_ptr cs, std::string &err, bool head = true);
+    /// The head's tail on `logits` (one row of the draft vocabulary): the greedy pick to out_ids_, its probability
+    /// to probs_, a subset index mapped back to a token id.  record_rest's own tail (on head_logits_) and MtpPair's.
+    bool record_post_head(const float* logits, dpct::queue_ptr cs, std::string& err);
     void norm_rope(float *data, const float *gamma, int rows, int cols,
                    const int32_t *p, dpct::queue_ptr cs);
     bool capture_prefill(int T, std::string& err);
@@ -289,6 +294,73 @@ private:
     float* head_logits_ = nullptr;
     float* dummy_inj_ = nullptr;
     int64_t cap_ = 0, attn_scratch_floats_ = 0;
+};
+
+/// STRATA_BATCH_MTP_PAIR_HEAD=1 (opt-in, experimental; --batch 2 with --batch-mtp; SYCL only): the two slot drafters
+/// at the SAME draft depth share one two-column head call (native_mmvq ncols = 2 in its multi-exact layout: each
+/// column bitwise the single-column call) instead of two single-column ones.  Depths are never batched across: for
+/// depth j the pair runs both slots' layer (their own graphs, head left out), then ONE head call over their two
+/// rows, then both slots' picks, then depth j + 1.  Every slot keeps its own K/V, residuals, tokens, picks,
+/// probabilities, mapped outputs and counters; the pair owns only the two-column Q8_1 input, the two logits rows and
+/// the graphs that bind both slots' buffers.  Default: every pair graph uses slot A's queue. The experimental
+/// STRATA_BATCH_MTP_OWNER_QUEUES=1 records each head-free forward on its owner's queue, host-joins both before
+/// the unchanged A-queue tail, and completes the tail before the next depth. Whole-pair graph is bypassed.
+/// Each graph still replays on the queue on which it was recorded.  A guard that fails (eligible()) leaves both
+/// slots to their own draft(); nothing is touched before every guard has passed.
+class MtpPair {
+public:
+    MtpPair() = default;
+    ~MtpPair();
+    MtpPair(const MtpPair&) = delete;
+    MtpPair& operator=(const MtpPair&) = delete;
+    /// After both slots' bind(): the static checks (one device, one head, the FULL Q5_K head, one vocabulary, one
+    /// window) and the shared scratch.  False with `err` set: the caller keeps the solo path for good.
+    bool init(MtpDrafter* a, MtpDrafter* b, std::string& err);
+    bool ready() const { return ok_; }
+    /// One slot's draft() arguments (min_p is always 0 and no probabilities are returned: the batch path's call).
+    struct Args {
+        const MtpDrafter* owner = nullptr; ///< must match the pair binding before any state changes
+        int T = 0;                        ///< the group's rows
+        const int32_t* tokens = nullptr;  ///< the window's picks for those rows
+        int64_t p = 0;                    ///< the group's first position
+        int a = 0;                        ///< the last accepted row
+        int32_t* drafts = nullptr;        ///< T - 1 drafts out (kVerifyMaxT entries)
+        int* n_drafts = nullptr;          ///< how many were made
+    };
+    /// Pure host, nothing touched: every per-call guard, `why` names the first that fails.  Both slots must take the
+    /// same number of steps (min(max_t - 1, max_drafts, max_cells - (p + a)) each, never truncated to match).
+    bool eligible(const Args& a, const Args& b, std::string& why) const;
+    /// Both slots' round and steps with the head shared: the same outputs as the two draft() calls.  After a failed
+    /// launch the pair queue is drained (both owners/branches in owner-queue mode) and false returned with `err`:
+    /// the slots' K/V has been written, so the caller
+    /// must report the failure, not draft again.
+    bool draft(const Args& a, const Args& b, std::string& err);
+
+private:
+    void drain_owner_queues() noexcept;
+    bool capture_pair_depth2(int T0, int T1, std::string& err);
+    bool capture_pre_round(int c, int T, std::string& err);
+    bool capture_pre_step(int c, int j, std::string& err);
+    bool capture_tail(int j, std::string& err);
+    int steps_of(const MtpDrafter& d, int64_t p, int a) const;
+    MtpDrafter* d_[2] = {nullptr, nullptr};
+    bool ok_ = false;
+    dpct::queue_ptr cs_ = nullptr;   ///< slot A's queue (not owned): shared tail/default pair graphs
+    bool owner_queues_ = false;     ///< Latched at init; immutable graph-queue selection.
+    bool owner_queues_marked_ = false; ///< Host selection only, not observed overlap.
+    dpct::queue_ptr alloc_queue_ = nullptr; ///< allocation context, retained even if init fails
+    uint8_t* xq2_ = nullptr;         ///< native_q8_1_bytes(N, 2): slot c's column at c * col_bytes_
+    float* logits2_ = nullptr;       ///< 2 * n_vocab floats: slot c's row at c * nv_
+    size_t col_bytes_ = 0;
+    int64_t nv_ = 0;
+    // per slot: the round without its head, for T rows; the step j without its head.  Per depth j: both heads in
+    // one call, both picks.
+    dpct::experimental::command_graph_exec_ptr pre_round_[2][9] = {};
+    dpct::experimental::command_graph_exec_ptr pre_step_[2][9] = {};
+    dpct::experimental::command_graph_exec_ptr tail_[9] = {};
+    // Whole-pair cache is used only at max_steps==2; T0/T1 are the exact effective round lengths (1..8).
+    dpct::experimental::command_graph_exec_ptr pair_exec_[9][9] = {};
+    bool pair_graph_marked_ = false; // Once per pair object; host selection, not GPU execution evidence.
 };
 
 }  // namespace strata::core

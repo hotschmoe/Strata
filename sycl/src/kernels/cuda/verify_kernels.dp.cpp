@@ -10,11 +10,13 @@
 #include "strata/sycl_doorbell.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/resident_plan_mirror.hpp"
+#include "strata/kernels/ep_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <atomic>
 #include <chrono>
@@ -1711,6 +1713,40 @@ void gdn_conv_commit(float* history, const float* qkv, int channels, const int32
     check("gdn_conv_commit");
 }
 
+// S147: existing declaration, only S145's privately tested domain; ordinary launches.
+bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, const float* qkv, int64_t qkv_stride,
+                       const float* h, int64_t h_stride, const float* gate, const float* beta, int64_t gb_stride,
+                       int conv_channels, int h_k, int h_v, int n_max, int n_layers, const int32_t* n_keep, void* stream) {
+    static const bool modes_ok = [] {
+        const char* sp = std::getenv("STRATA_GDN_SPLIT");
+        const char* cs = std::getenv("STRATA_GDN_COMMIT_SPLIT");
+        const char* dbg = std::getenv("STRATA_DBG_GDN");
+        return (!sp || std::strcmp(sp, "0") == 0) && (!cs || std::strcmp(cs, "1") == 0) &&
+               (!dbg || std::strcmp(dbg, "0") == 0);
+    }();
+    if (!modes_ok || !stream || !state || !qkv || !h || !gate || !beta || !n_keep ||
+        conv_channels != 10240 || h_k != 16 || h_v != 48 || n_max != 3 || n_layers != 36 ||
+        state_stride != 817152 || conv_off != 786432 || qkv_stride != 81920 || h_stride != 81920 || gb_stride != 384)
+        return false;
+    auto* q = strata::q_of(stream);
+    if (!q->has_property<sycl::property::queue::in_order>()) return false;
+    q->parallel_for<class gdn_conv_commit_layers_s147>(
+        sycl::nd_range<3>(sycl::range<3>(1, 36, 40) * sycl::range<3>(1, 1, 256), sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3> item) {
+            const int64_t l = item.get_group(1);
+            gdn_conv_commit_kernel(state + l * state_stride + conv_off, qkv + l * qkv_stride, conv_channels, n_keep);
+        });
+    q->parallel_for<class gdn_state_commit_layers_s147>(
+        sycl::nd_range<3>(sycl::range<3>(36, 4, 48) * sycl::range<3>(1, RG, 32), sycl::range<3>(1, RG, 32)),
+        [=](sycl::nd_item<3> item) {
+            const int64_t l = item.get_group(0);
+            gdn_step_commit_kernel(state + l * state_stride, h + l * h_stride, conv_channels,
+                                   gate + l * gb_stride, beta + l * gb_stride, h_k, h_v, n_keep);
+        });
+    check("gdn_commit_layers");
+    return true;
+}
+
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream) {
     if (n_embd % 8 != 0 || n_tok < 1 || n_tok > kVerifyMaxT) {
@@ -2086,7 +2122,8 @@ resident_plan_kernel(const int32_t *__restrict__ ids, int n, int k,
                      const unsigned long long *slot_off, long long blob,
                      int32_t *__restrict__ pl, long long capx, uint32_t *skip,
                      uint32_t ring, const unsigned long long *__restrict__ mir,
-                     volatile uint32_t *plan_err, int32_t *usage) {
+                     volatile uint32_t *plan_err, int32_t *usage,
+                     const int32_t *__restrict__ res_other = nullptr, int ep_role = 0) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 auto &s_ids = *sycl::ext::oneapi::group_local_memory_for_overwrite<
     int32_t[kResidentPlanMax]>(
@@ -2106,15 +2143,20 @@ auto &s_ids = *sycl::ext::oneapi::group_local_memory_for_overwrite<
     int32_t eid = -1;
     int32_t slot = -1;
     unsigned long long maddr = 0;   // SYCL port: a host-mirrored expert (not in VRAM): its pinned mirror, read over PCIe
+    bool foreign = false;           // expert parallelism (ep_kernels.hpp): the other card computes this entry
     if (tid < n) {
         eid = ids[tid];
         s_ids[tid] = eid;
-        slot = (eid >= 0 && eid < n_expert) ? res[eid] : -1;
-        if (slot < 0 && eid >= 0 && eid < n_expert && mir != nullptr) maddr = mir[eid];
-        if (usage != nullptr && eid >= 0 && eid < n_expert)   // the adaptive tier's routing counts (device side)
+        const bool in_range = eid >= 0 && eid < n_expert;
+        slot = in_range ? res[eid] : -1;
+        if (usage != nullptr && in_range)   // the adaptive tier's routing counts (device side)
             sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
                              sycl::access::address_space::global_space>(usage[eid]).fetch_add(1);
-        if (slot < 0 && maddr == 0)
+        // card 0 owns what it holds; card 1 owns what card 0 does not hold (`res` is the planning card's own table)
+        if (ep_role == 1 && slot < 0 && in_range) foreign = res_other[eid] >= 0;
+        if (ep_role == 2 && in_range && res_other[eid] >= 0) { foreign = true; slot = -1; }
+        if (slot < 0 && in_range && mir != nullptr && !foreign) maddr = mir[eid];
+        if (slot < 0 && maddr == 0 && !foreign)
             dpct::atomic_fetch_or<sycl::access::address_space::generic_space>(
                 &s_bad, 1);
     }
@@ -2199,7 +2241,7 @@ auto &s_ids = *sycl::ext::oneapi::group_local_memory_for_overwrite<
                                  : maddr;
         start[grp_idx] = ent_start;
     }
-    if (tid < n) {
+    if (tid < n && !foreign) {
         const int fj_warp = first_j >> 5;
         int fj_tot = s_excl[first_j];
 #pragma unroll
@@ -2211,11 +2253,13 @@ auto &s_ids = *sycl::ext::oneapi::group_local_memory_for_overwrite<
         tok[out_idx] = tid / k;
     }
     if (tid == 0) {
-        const int groups = (s_wsum[0] + s_wsum[1] + s_wsum[2] + s_wsum[3]) & 0xffff;
-        start[groups] = n;
-        start2[0] = n;
+        const int packed = s_wsum[0] + s_wsum[1] + s_wsum[2] + s_wsum[3];
+        const int groups = packed & 0xffff;
+        const int ents = ep_role != 0 ? (packed >> 16) : n;   // without a peer every entry is in a group
+        start[groups] = ents;
+        start2[0] = ents;
         counts[0] = groups;
-        counts[1] = n;
+        counts[1] = ents;
         counts[2] = 0;
         if (skip != nullptr) {
             /*
@@ -2403,6 +2447,29 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                     });
     }
     check("resident_plan");
+}
+void resident_plan_ep(const int32_t* ids, int n_entries, int k, const int32_t* res0, const int32_t* res1, int role,
+                      int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
+                      int32_t* plan, long long capx, void* stream, uint32_t* plan_err) {
+    const int32_t* own = role == 1 ? res0 : res1;
+    const int32_t* other = role == 1 ? res1 : res0;
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        strata::q_of(stream)
+            ->parallel_for<dpct_kernel_name<class resident_plan_ep_kernel>>(
+                sycl::nd_range<3>(sycl::range(1, 1, kResidentPlanMax),
+                                  sycl::range(1, 1, kResidentPlanMax)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        resident_plan_kernel(
+                            ids, n_entries, k, own, n_expert, cache_base,
+                            slot_off, blob, plan, capx, nullptr, 0, nullptr, plan_err, nullptr, other, role);
+                    });
+    }
+    check("resident_plan_ep");
 }
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
     const uint32_t spin_max = strata::spin_max(*strata::q_of(stream));

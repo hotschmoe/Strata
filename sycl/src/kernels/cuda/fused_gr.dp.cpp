@@ -862,7 +862,7 @@ void launch_gr_up_cols(dpct::queue_ptr st, const GrMulti& m, bool grf) {
             [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_up_multi_kernel<C, true>(m); });
     else
         st->parallel_for<dpct_kernel_name<class gr_up_multi_cols, dpct_kernel_scalar<C>>>(r, exp_props,
-            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_up_multi_kernel<C>(m); });
+            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_up_multi_kernel<C, false, (C == UPM_COLS)>(m); });
 }
 inline void launch_gr_up_multi(dpct::queue_ptr st, const GrMulti& m, bool grf = false) {
     switch (gr_up_cols()) {

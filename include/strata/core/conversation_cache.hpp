@@ -33,6 +33,13 @@ struct ConversationCheckpoint {
     // Whole-session parking is currently single-GPU and rejects these parts.
     std::vector<ConversationCheckpoint> stage_parts;
 
+    // Payload copied by conversation_checkpoint_restore, after validation.
+    // The dead row is also restored to the indexer's distinct pooled spare row.
+    size_t restore_payload_bytes() const {
+        return gdn.size() + ple.size() + tails.size() + dead.size() + block_pos.size() +
+               (ids.empty() ? 0 : dead.size());
+    }
+
     size_t bytes() const {
         size_t n = ids.capacity() * sizeof(int32_t) + imgs.capacity() * sizeof(ConversationImageKey) +
                gdn.capacity() + ple.capacity() + tails.capacity() + dead.capacity() + block_pos.capacity() +
@@ -163,6 +170,16 @@ struct SavedConversation {
         return false;
     }
 
+    // Snapshot restore API payload, not retained allocation capacity or PCIe traffic.
+    // Excludes metadata and retained checkpoints; ring refills/map kernels are separate.
+    size_t restore_payload_bytes() const {
+        size_t n = live.restore_payload_bytes();
+        for (const auto& k : kv)
+            n += k.k.size() + k.v.size() + k.k_scale.size() + k.v_scale.size() + k.pooled.size();
+        for (const auto& s : stage_images) n += s.restore_payload_bytes();
+        return n;
+    }
+
     size_t bytes() const {
         size_t n = live.bytes() + checkpoints.capacity() * sizeof(ConversationCheckpoint) +
                    kv.capacity() * sizeof(ConversationKv);
@@ -172,6 +189,24 @@ struct SavedConversation {
         return n;
     }
 };
+
+/// `c` holds the state `ids` (with `images`) describes, or a continuation of it: its tokens start with `ids` and
+/// its pictures below ids.size() are exactly `images`.  What an idle batch slot holds is then parked already (or
+/// a longer continuation is), so the slot need not park it again before an admission overwrites it.
+template<class Token>
+bool conversation_covers(const ConversationCheckpoint& c, const std::vector<Token>& ids,
+                         const std::vector<ConversationImageKey>& images) {
+    const size_t n = ids.size();
+    if (n == 0 || c.ids.size() < n) return false;
+    for (size_t i = 0; i < n; ++i)
+        if ((int64_t) c.ids[i] != (int64_t) ids[i]) return false;
+    size_t j = 0;
+    for (const auto& image : c.imgs) {
+        if (image.start >= (int64_t) n) continue;
+        if (j == images.size() || !(images[j++] == image)) return false;
+    }
+    return j == images.size();
+}
 
 template<class Token>
 int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<Token>& prompt,
@@ -252,6 +287,19 @@ public:
             for (const auto& c : e.checkpoints) consider(c, false);
         }
         return best;
+    }
+
+    /// A parked conversation holds this state already (its live tokens or one of its checkpoints start with `ids`,
+    /// same pictures, same steering): see conversation_covers.  Read-only; no LRU effect.
+    template<class Token>
+    bool holds(const std::vector<Token>& ids, const std::vector<ConversationImageKey>& images, bool cvec) const {
+        for (const auto& e : entries_) {
+            if (e.cvec != cvec) continue;
+            if (conversation_covers(e.live, ids, images)) return true;
+            for (const auto& c : e.checkpoints)
+                if (conversation_covers(c, ids, images)) return true;
+        }
+        return false;
     }
 
     SavedConversation take(size_t index) {

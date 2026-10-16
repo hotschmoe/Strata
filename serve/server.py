@@ -1304,10 +1304,13 @@ class StrataEngine:
         return None
 
     def _apply_bdone(self, f: list[str]) -> None:
-        """`BDONE <slot> <produced> <finish> <ms>` into this request's figures."""
+        """`BDONE <slot> <produced> <finish> <ms> [accepted offered]` into this request's figures."""
         if len(f) >= 5 and isinstance(self.last, dict):
             self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
                          "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
+            if len(f) >= 7:   # optional accepted/offered counts for the slot leg; keep the admission's counts
+                self.last["drafts_accepted"] = (self.last.get("drafts_accepted") or 0) + int(f[5])
+                self.last["drafts_offered"] = (self.last.get("drafts_offered") or 0) + int(f[6])
 
     def _bdone_after_eos(self, slot: int, wait_s: float = 2.0):
         """#1869: a request in a slot whose consumer left at the stop token has its BDONE right behind it (the engine prints it
@@ -2566,8 +2569,9 @@ def layer_split_value(cfg: dict) -> str:
 
 def layer_split_of(cfg: dict) -> bool:
     """Several GPUs in the config are a layer split, unless the args put the later card(s) to another use: with
-    --peer-device the second card is an expert-cache tier, and the engine refuses that beside --layer-split (#665)."""
-    return len(gpu_list(cfg)) > 1 and "--peer-device" not in cfg["args"]
+    --peer-device the second card is an expert-cache tier, with --expert-parallel-device (SYCL) it computes its share
+    of every layer's experts, and the engine refuses either beside --layer-split (#665)."""
+    return len(gpu_list(cfg)) > 1 and not any(a in cfg["args"] for a in ("--peer-device", "--expert-parallel-device"))
 
 
 def engine_args(cfg: dict) -> list[str]:
@@ -4541,6 +4545,10 @@ def carry_leg(carry: dict, leg: dict) -> None:
     replaces the engine's figures: keep the slot leg's decode time, tokens and prompt figures to add to it."""
     carry["decode_ms"] = carry.get("decode_ms", 0.0) + float(leg.get("decode_ms") or 0.0)
     carry["generated"] = carry.get("generated", 0) + int(leg.get("generated") or 0)
+    # A later DONE replaces the slot leg's figures, including its optional draft counts.
+    for key in ("drafts_offered", "drafts_accepted"):
+        if leg.get(key) is not None:
+            carry[key] = carry.get(key, 0) + int(leg[key])
     carry.setdefault("prompt_ms", float(leg.get("prompt_ms") or 0.0))
     if leg.get("prompt_read") is not None:
         carry.setdefault("prompt_read", int(leg["prompt_read"]))
@@ -4554,6 +4562,9 @@ def add_carry(carry: dict, last: dict) -> dict:
            "prompt_ms": max(float(last.get("prompt_ms") or 0.0), carry.get("prompt_ms", 0.0))}
     if "prompt_read" in carry:
         out["prompt_read"] = carry["prompt_read"]
+    for key in ("drafts_offered", "drafts_accepted"):
+        if key in carry:
+            out[key] = int(last.get(key) or 0) + carry[key]
     return out
 
 
@@ -6728,6 +6739,9 @@ def main() -> int:
             except ValueError as e:
                 raise SystemExit(f"[strata] config {e}")
             print(f"[strata] layer split across GPUs {gpu_list(cfg)} ({split})", flush=True)
+        elif len(gpu_list(cfg)) > 1 and "--expert-parallel-device" in cfg["args"]:
+            print(f"[strata] GPUs {gpu_list(cfg)}: the cards compute each layer's experts together "
+                  "(--expert-parallel-device)", flush=True)
         elif len(gpu_list(cfg)) > 1:
             print(f"[strata] GPUs {gpu_list(cfg)}: the later card(s) serve as the peer expert tier (--peer-device)",
                   flush=True)

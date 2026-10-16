@@ -3,9 +3,14 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
+#include "strata/core/host_boundary_profile.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/on_device.hpp"
+#if !defined(STRATA_USE_HIP) && !defined(__HIPCC__)
+#include "mtp_argmax_s112.hpp"   // isolated tested kernel; this SYCL TU only
+#include <cstddef>
+#endif
 
 #include "strata/core/native_head.hpp"
 #include "strata/core/peer_experts.hpp"
@@ -19,6 +24,7 @@
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/native_head_mmvq.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/native_router.hpp"
@@ -57,6 +63,20 @@ namespace strata::core {
 namespace {
 
 constexpr float EPS = 1e-6f;
+
+#if !defined(STRATA_USE_HIP) && !defined(__HIPCC__)
+// Process immutable before captures: bind() initializes this, not a mutable graph key.
+bool mtp_parallel_argmax_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MTP_PARALLEL_ARGMAX");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+static_assert(sizeof(s112_private::ArgRow) == 1040 && alignof(s112_private::ArgRow) == 4 &&
+              offsetof(s112_private::ArgRow, counter) == 0 &&
+              offsetof(s112_private::ArgRow, v) == 16 && offsetof(s112_private::ArgRow, i) == 528);
+#endif
 
 // #783 PR-i: STRATA_MTP_CATCHUP_ALL=1 catches the drafter's K/V up for the whole verified window, rejected rows included
 bool mtp_catchup_all() {
@@ -771,6 +791,17 @@ bool MtpDrafter::bind(const WeightTable &wt, const NativeHead *head,
                                                   "MTP draft head");
         }
     }
+#if !defined(STRATA_USE_HIP) && !defined(__HIPCC__)
+    // Initialize the process flag before any captures; existing owner arena is already zeroed.
+    const bool parallel_argmax = mtp_parallel_argmax_on();
+    if (parallel_argmax && dhead_ == nullptr && n_vocab_ == 248320 &&
+        (max_t_ < 1 || arg_scratch_ == nullptr ||
+         strata::kernels::argmax_rows_scratch_bytes(1) != sizeof(s112_private::ArgRow) ||
+         strata::kernels::argmax_rows_scratch_bytes(max_t_) < sizeof(s112_private::ArgRow))) {
+        err = "mtp: parallel argmax scratch ABI/capacity mismatch";
+        return false;
+    }
+#endif
     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
     return true;
 }
@@ -782,12 +813,12 @@ catch (sycl::exception const &exc) {
 
 // The layer for T rows.  full = false stops after the K/V append (the prompt only needs the cache).
 bool MtpDrafter::record_forward(int T, int step_row0, dpct::queue_ptr cs,
-                                std::string &err) {
+                                std::string &err, bool head) {
     // step_row0 >= 0: the full layer on step rows [step_row0, +T); step_row0 < 0: K/V only on rows [-1 - step_row0, +T)
     const bool full = step_row0 >= 0;
     if (full && T != 1) { err = "mtp: the full layer runs one row at a time (its attention scratch is sized for one)"; return false; }
     if (!record_front(T, full ? step_row0 : -1 - step_row0, cs, err)) return false;
-    return !full || record_rest(step_row0, cs, err);
+    return !full || record_rest(step_row0, cs, err, head);
 }
 
 bool MtpDrafter::record_front(int T, int row0, dpct::queue_ptr cs,
@@ -908,7 +939,7 @@ void MtpDrafter::norm_rope(float *data, const float *gamma, int rows, int cols,
 }
 
 bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
-                             std::string &err) {
+                             std::string &err, bool head) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
@@ -1113,11 +1144,12 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
                         bf16("hyper_connection_mixer.input_mix_weight_up.weight"), nullptr, EPS, gs, ss.block.gr,
                         sample_ + t * N, dummy_inj_, cs);
         }
+        if (!head) return true;   // MtpPair: the head over both slots' sample_ rows is one shared launch
         native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dhead_ != nullptr;
         const int64_t nv = sub ? n_dvocab_ : n_vocab_;
-        native_mmvq(sub ? dhead_type_ : head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N,
-                    (int) nv, T, cs);
+        if (sub) native_mmvq(dhead_type_, dhead_, xq_, head_logits_, (int) N, (int) nv, T, cs);
+        else native_mmvq_head(head_->type(), head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
         if (coupled_rec_) {
             // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft
             // (counter = this cell + 1, from its step record), penalties over the ring; T == 1 (full layer)
@@ -1125,16 +1157,43 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
                                  cparams_, cring_, kCoupledHistCap, coupled_j_, step, cscratch_, out_ids_, probs_, cs);
             return true;
         }
+    } catch (const std::exception& e) {
+        err = std::string("mtp: ") + e.what();
+        return false;
+    }
+    return record_post_head(head_logits_, cs, err);   // the same calls in the same order as before the split
+}
+
+bool MtpDrafter::record_post_head(const float* logits, dpct::queue_ptr cs, std::string& err) {
+    using namespace strata::kernels;
+    const int T = 1;
+    const bool sub = dhead_ != nullptr;
+    const int64_t nv = sub ? n_dvocab_ : n_vocab_;
+    try {
         if (argmax_rows_wanted()) {
-            argmax_rows(head_logits_, T, (int) nv, arg_scratch_, out_ids_, cs);
+            argmax_rows(logits, T, (int) nv, arg_scratch_, out_ids_, cs);
         } else {
             SamplerParams sp;
             sp.greedy = true;
             sp.temperature = 0.0f;
-            sample_tokens(head_logits_, T, (int) nv, nullptr, 0, sp, out_ids_, cs);
+#if !defined(STRATA_USE_HIP) && !defined(__HIPCC__)
+            if (!sub && T == 1 && nv == 248320 && !coupled_active_ && !coupled_rec_ &&
+                sp.greedy && sp.temperature <= 0.0f && sp.penalty_last_n == 0 &&
+                sp.penalty_repeat == 1.0f && sp.penalty_freq == 0.0f && sp.penalty_present == 0.0f &&
+                mtp_parallel_argmax_on()) {
+                // First eligible HOST selection only, not per-call/GPU execution evidence.
+                static const bool logged = [] {
+                    std::fprintf(stderr, "strata MTP parallel argmax: enabled=1 rows=1 vocab=248320 host-selection-only\n");
+                    return true;
+                }();
+                (void) logged;
+                s112_private::launch(logits, (int) nv, arg_scratch_, out_ids_, *cs);
+            } else
+#endif
+                sample_tokens(logits, T, (int) nv, nullptr, 0, sp, out_ids_, cs);
         }
-        if (multi_block_head_ops()) row_top_prob_split(head_logits_, T, (int) nv, out_ids_, probs_, top_scratch_, cs);
-        else row_top_prob(head_logits_, T, (int) nv, out_ids_, probs_, cs);
+        if (multi_block_head_ops()) row_top_prob_split(logits, T, (int) nv, out_ids_, probs_, top_scratch_, cs);
+        else row_top_prob(logits, T, (int) nv, out_ids_, probs_, cs);
         if (sub) map_ids(out_ids_, dvocab_, T, cs);
     } catch (const std::exception& e) {
         err = std::string("mtp: ") + e.what();
@@ -1146,7 +1205,7 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
 namespace {
 bool finish_capture(dpct::queue_ptr cs, bool ok,
                     dpct::experimental::command_graph_exec_ptr &exec,
-                    const char *what, std::string &err) try {
+                    const char *what, std::string &err, bool propagate_error = false) try {
     dpct::experimental::command_graph_ptr graph = nullptr;
     const dpct::err0 ce =
         DPCT_CHECK_ERROR(dpct::experimental::end_recording(cs, &graph));
@@ -1179,6 +1238,7 @@ bool finish_capture(dpct::queue_ptr cs, bool ok,
     return true;
 }
 catch (sycl::exception const &exc) {
+  if (propagate_error) { err = std::string("mtp pair capture: ") + exc.what(); return false; }
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
   std::exit(1);
@@ -1533,7 +1593,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (!mtp_catchup_all()) T = a + 1;
     const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
     if (!capture_round(T, cp, err)) return false;
-    const int max_steps = std::min(max_t_ - 1, max_drafts_);
+    // Match the CUDA drafter: draft j writes at p + a + j, within the allocated K/V cells.
+    const int max_steps = (int) std::min<int64_t>(std::min(max_t_ - 1, max_drafts_), st_.max_cells - (p + a));
     for (int j = 1; j < max_steps; ++j)
         if (!capture_step(j, cp, err)) return false;
     const Clock::time_point t0 = Clock::now();
@@ -1560,7 +1621,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (!stage_source_R(T, err)) return false;
 
     SessionState* const pss = ple_ss_ ? ple_ss_ : ss_;
-    const bool do_ple = pss != nullptr && pss->ple.ready() && pss->ple.table != nullptr;
+    const bool do_ple = pss != nullptr && pss->ple.table != nullptr && pss->ple.table->is_open();
     int32_t ple_prev[2] = {do_ple ? pss->ple_prev[0] : 0, do_ple ? pss->ple_prev[1] : 0};
     auto prefetch_ple = [&](int32_t tok) {
         if (!do_ple || tok < 0) return;
@@ -1964,6 +2025,472 @@ catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
   std::exit(1);
+}
+
+// ---- STRATA_BATCH_MTP_PAIR_HEAD (mtp.hpp MtpPair): two slots' heads in one call per draft depth
+
+namespace {
+bool pair_graph_depth2_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_BATCH_MTP_PAIR_GRAPH");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return on;
+}
+bool pair_owner_queues_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_BATCH_MTP_OWNER_QUEUES");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    return on;
+}
+} // namespace
+
+void MtpPair::drain_owner_queues() noexcept {
+    if (!owner_queues_) return;
+    for (MtpDrafter* d : d_) if (d != nullptr) {
+        try { if (d->cs_) d->cs_->wait(); } catch (...) {}
+        try { if (d->side_ && d->side_ != d->cs_) d->side_->wait(); } catch (...) {}
+    }
+}
+
+MtpPair::~MtpPair() {
+    drain_owner_queues();
+    if (cs_) { try { cs_->wait(); } catch (...) {} }
+    for (auto& by_first : pair_exec_) for (auto& e : by_first) if (e) delete e;
+    for (auto& per_slot : pre_round_) for (auto& e : per_slot) if (e) delete e;
+    for (auto& per_slot : pre_step_) for (auto& e : per_slot) if (e) delete e;
+    for (auto& e : tail_) if (e) delete e;
+    if (alloc_queue_) { try { alloc_queue_->wait(); } catch (...) {} }
+    if (xq2_) sycl::free(xq2_, *alloc_queue_);
+    if (logits2_) sycl::free(logits2_, *alloc_queue_);
+}
+
+int MtpPair::steps_of(const MtpDrafter& d, int64_t p, int a) const {
+    // exactly draft()'s max_steps: draft j writes at p + a + j, within the allocated K/V cells
+    return (int) std::min<int64_t>(std::min(d.max_t_ - 1, d.max_drafts_), d.st_.max_cells - (p + a));
+}
+
+bool MtpPair::init(MtpDrafter* a, MtpDrafter* b, std::string& err) try {
+    ok_ = false;
+    if (a == nullptr || b == nullptr || a == b) { err = "mtp pair: needs two slot drafters"; return false; }
+    if (a->head_ == nullptr || b->head_ == nullptr || a->cs_ == nullptr || b->cs_ == nullptr || a->g_ == nullptr) {
+        err = "mtp pair: the slots are not bound";
+        return false;
+    }
+    if (a->device_ != b->device_ || a->g_ != b->g_ || a->head_ != b->head_ || a->max_t_ != b->max_t_ ||
+        a->n_vocab_ != b->n_vocab_) {
+        err = "mtp pair: the two slots differ (device, head, window or vocabulary)";
+        return false;
+    }
+    if (a->dhead_ != nullptr || b->dhead_ != nullptr) {
+        err = "mtp pair: the first probe shares the full head only (STRATA_MTP_FULL_HEAD=1 or no draft_vocab.bin)";
+        return false;
+    }
+    if (a->head_->type() != 13) {   // Q5_K: the format the shared two-column call was measured on
+        err = "mtp pair: the first probe shares a Q5_K head only (type " + std::to_string(a->head_->type()) + ")";
+        return false;
+    }
+    if (a->force_on_ || b->force_on_ || a->h_force_ != nullptr || b->h_force_ != nullptr) {
+        err = "mtp pair: not with the forcing graphs (--pipeline-windows 2)";
+        return false;
+    }
+    if (!strata::kernels::native_mmvq_multi_exact()) { err = "mtp pair: needs the multi-exact MMVQ layout"; return false; }
+    if (MtpDrafter::top2_env()) { err = "mtp pair: not with STRATA_MTP_TOP2 (it reads a slot's own head logits)"; return false; }
+    if (a->max_t_ < 1 || a->max_t_ > 8) { err = "mtp pair: window out of range"; return false; }
+    const OnDevice on_device(a->device_);
+    const int N = (int) a->g_->n_embd;
+    col_bytes_ = strata::kernels::native_q8_1_bytes(N, 1);
+    if (strata::kernels::native_q8_1_bytes(N, 2) != 2 * col_bytes_) { err = "mtp pair: unexpected Q8_1 column layout"; return false; }
+    nv_ = a->n_vocab_;
+    sycl::queue& q = dpct::get_in_order_queue();
+    alloc_queue_ = &q;
+    xq2_ = (uint8_t*) sycl::malloc_device(2 * col_bytes_, q);
+    logits2_ = sycl::malloc_device<float>((size_t) 2 * (size_t) nv_, q);
+    if (xq2_ == nullptr || logits2_ == nullptr) { err = "mtp pair: the shared head scratch does not fit"; return false; }
+    q.memset(xq2_, 0, 2 * col_bytes_).wait();
+    q.memset(logits2_, 0, (size_t) 2 * (size_t) nv_ * sizeof(float)).wait();
+    d_[0] = a;
+    d_[1] = b;
+    cs_ = a->cs_;
+    owner_queues_ = pair_owner_queues_on(); // Immutable for this pair and its captured graph caches.
+    if (owner_queues_ && a->cs_ == b->cs_) {
+        err = "mtp pair: owner queues need two distinct slot queues";
+        return false;
+    }
+    ok_ = true;
+    return true;
+} catch (sycl::exception const& e) {
+    err = std::string("mtp pair: ") + e.what();
+    return false;
+}
+
+bool MtpPair::eligible(const Args& A, const Args& B, std::string& why) const {
+    if (!ok_) { why = "the pair is not set up"; return false; }
+    const Args* args[2] = {&A, &B};
+    int steps[2] = {0, 0};
+    for (int c = 0; c < 2; ++c) {
+        const MtpDrafter& d = *d_[c];
+        const Args& x = *args[c];
+        if (x.owner != &d) { why = "arguments do not match the bound slot"; return false; }
+        if (x.tokens == nullptr || x.drafts == nullptr) { why = "null arguments"; return false; }
+        if (x.T < 1 || x.T > d.max_t_ || x.a < 0 || x.a >= x.T) { why = "draft arguments out of range"; return false; }
+        if (d.chain_live_) { why = "a pipelined chain is in flight"; return false; }
+        if (d.coupled_active_ || d.coupled_rec_) { why = "coupled draft sampling"; return false; }
+        if (d.force_on_ || d.h_force_ != nullptr) { why = "the forcing graphs"; return false; }
+        if (d.src_R_ != nullptr) { why = "a rebound residual source"; return false; }
+        if (d.dhead_ != nullptr || d.head_ != d_[0]->head_) { why = "the head changed"; return false; }
+        steps[c] = steps_of(d, x.p, x.a);
+    }
+    if (steps[0] < 1 || steps[1] < 1) { why = "a slot has no step left"; return false; }
+    if (steps[0] != steps[1]) { why = "different step counts (" + std::to_string(steps[0]) + " vs " + std::to_string(steps[1]) + ")"; return false; }
+    if (MtpDrafter::top2_env()) { why = "STRATA_MTP_TOP2"; return false; }
+    return true;
+}
+
+bool MtpPair::capture_pre_round(int c, int T, std::string& err) try {
+    dpct::experimental::command_graph_exec_ptr& exec = pre_round_[c][T];
+    if (exec) return true;
+    using namespace strata::kernels;
+    MtpDrafter& d = *d_[c];
+    dpct::queue_ptr q = owner_queues_ ? d.cs_ : cs_;
+    const int64_t N = d.g_->n_embd, NH = d.g_->n_head, HCN = d.g_->hc * N;
+    const int ra = 2 * d.max_t_ - 1;
+    if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(q)) != 0) { err = "mtp pair: begin capture"; return false; }
+    bool ok = true;
+    try {
+        // capture_round's inputs and front, then the rest without its head (the pair's tail graph runs it)
+        const MappedCopy in[7] = {{d.tok_, d.m_tok_, T}, {d.step_, d.m_step_, (int64_t) 2 * T * 4}, {d.pos_, d.m_pos_, 2 * T * NH},
+                                  {d.row_, d.m_row_, 2}, {d.Rin_, d.window_R_, T * HCN}, {d.step_ + ra * 4, d.m_step_ + ra * 4, 4},
+                                  {d.pos_ + ra * NH, d.m_pos_ + ra * NH, NH}};
+        copy_from_mapped_multi(in, 7, q);
+        ok = d.record_front(T, 0, q, err);
+        if (ok && T > 1) {
+            copy_row_to_first(d.row_, d.R_, HCN, d.inj_, d.g_->hc, d.mixed_, N, q);
+            native_quantize_q8_1(d.mixed_, d.xq_, (int) N, 1, q);
+        }
+        if (ok) ok = d.record_rest(ra, q, err, false);
+    } catch (const std::exception& e) {
+        err = std::string("mtp pair: ") + e.what();
+        ok = false;
+    }
+    return finish_capture(q, ok, exec, "pair round", err, true);
+}
+catch (sycl::exception const &exc) {
+    err = std::string("mtp pair capture: ") + exc.what();
+    return false;
+}
+
+bool MtpPair::capture_pre_step(int c, int j, std::string& err) try {
+    dpct::experimental::command_graph_exec_ptr& exec = pre_step_[c][j];
+    if (exec) return true;
+    using namespace strata::kernels;
+    MtpDrafter& d = *d_[c];
+    dpct::queue_ptr q = owner_queues_ ? d.cs_ : cs_;
+    const int64_t NH = d.g_->n_head;
+    const int row = d.max_t_ + j - 1;
+    if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(q)) != 0) { err = "mtp pair: begin capture"; return false; }
+    bool ok = true;
+    try {
+        const MappedCopy in[2] = {{d.step_ + row * 4, d.m_step_ + row * 4, 4}, {d.pos_ + row * NH, d.m_pos_ + row * NH, NH}};
+        copy_from_mapped_multi(in, 2, q);
+        ok = d.record_forward(1, row, q, err, false);
+    } catch (const std::exception& e) {
+        err = std::string("mtp pair: ") + e.what();
+        ok = false;
+    }
+    return finish_capture(q, ok, exec, "pair step", err, true);
+}
+catch (sycl::exception const &exc) {
+    err = std::string("mtp pair capture: ") + exc.what();
+    return false;
+}
+
+// Depth j's tail for both slots: their two mixed rows quantized into the two columns, ONE two-column head call,
+// each slot's pick and probability from its own logits row, each slot's next input (mtp_select) to its own buffers.
+bool MtpPair::capture_tail(int j, std::string& err) try {
+    dpct::experimental::command_graph_exec_ptr& exec = tail_[j];
+    if (exec) return true;
+    using namespace strata::kernels;
+    MtpDrafter& a = *d_[0];
+    MtpDrafter& b = *d_[1];
+    const int64_t N = a.g_->n_embd, HCN = a.g_->hc * N;
+    if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs_)) != 0) { err = "mtp pair: begin capture"; return false; }
+    bool ok = true;
+    try {
+        native_quantize_q8_1(a.sample_, xq2_, (int) N, 1, cs_);
+        native_quantize_q8_1(b.sample_, xq2_ + col_bytes_, (int) N, 1, cs_);
+        native_mmvq_head(a.head_->type(), a.head_->weights(), xq2_, logits2_, (int) N, (int) nv_, 2, cs_);
+        ok = a.record_post_head(logits2_, cs_, err) && b.record_post_head(logits2_ + nv_, cs_, err);
+        if (ok) {
+            mtp_select(a.R_, HCN, a.out_ids_, a.row_ + 1, a.Rin_, a.tok_, a.m_out_, j, cs_, a.probs_, a.m_prob_);
+            mtp_select(b.R_, HCN, b.out_ids_, b.row_ + 1, b.Rin_, b.tok_, b.m_out_, j, cs_, b.probs_, b.m_prob_);
+        }
+    } catch (const std::exception& e) {
+        err = std::string("mtp pair: ") + e.what();
+        ok = false;
+    }
+    return finish_capture(cs_, ok, exec, "pair head", err, true);
+}
+catch (sycl::exception const &exc) {
+    err = std::string("mtp pair capture: ") + exc.what();
+    return false;
+}
+
+// Only depth2: the exact effective (T0,T1) key fixes every recorded row/shape.
+// Ordinary recording of the existing kernel calls; no nested executable graphs.
+bool MtpPair::capture_pair_depth2(int T0, int T1, std::string& err) try {
+    auto& exec = pair_exec_[T0][T1];
+    if (exec) return true;
+    using namespace strata::kernels;
+    cs_->wait_and_throw();
+    if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs_)) != 0) {
+        err = "mtp pair: whole depth2 begin capture";
+        return false;
+    }
+    bool ok = true;
+    try {
+        auto record_round = [&](int c, int T) {
+            MtpDrafter& d = *d_[c];
+            const int64_t N = d.g_->n_embd, NH = d.g_->n_head, HCN = d.g_->hc * N;
+            const int ra = 2 * d.max_t_ - 1;
+            bool ok = true;
+        // capture_round's inputs and front, then the rest without its head (the pair's tail graph runs it)
+        const MappedCopy in[7] = {{d.tok_, d.m_tok_, T}, {d.step_, d.m_step_, (int64_t) 2 * T * 4}, {d.pos_, d.m_pos_, 2 * T * NH},
+                                  {d.row_, d.m_row_, 2}, {d.Rin_, d.window_R_, T * HCN}, {d.step_ + ra * 4, d.m_step_ + ra * 4, 4},
+                                  {d.pos_ + ra * NH, d.m_pos_ + ra * NH, NH}};
+        copy_from_mapped_multi(in, 7, cs_);
+        ok = d.record_front(T, 0, cs_, err);
+        if (ok && T > 1) {
+            copy_row_to_first(d.row_, d.R_, HCN, d.inj_, d.g_->hc, d.mixed_, N, cs_);
+            native_quantize_q8_1(d.mixed_, d.xq_, (int) N, 1, cs_);
+        }
+        if (ok) ok = d.record_rest(ra, cs_, err, false);
+            return ok;
+        };
+        auto record_step = [&](int c, int j) {
+            MtpDrafter& d = *d_[c];
+            const int64_t NH = d.g_->n_head;
+            const int row = d.max_t_ + j - 1;
+            bool ok = true;
+        const MappedCopy in[2] = {{d.step_ + row * 4, d.m_step_ + row * 4, 4}, {d.pos_ + row * NH, d.m_pos_ + row * NH, NH}};
+        copy_from_mapped_multi(in, 2, cs_);
+        ok = d.record_forward(1, row, cs_, err, false);
+            return ok;
+        };
+        auto record_tail = [&](int j) {
+            MtpDrafter& a = *d_[0];
+            MtpDrafter& b = *d_[1];
+            const int64_t N = a.g_->n_embd, HCN = a.g_->hc * N;
+            bool ok = true;
+        native_quantize_q8_1(a.sample_, xq2_, (int) N, 1, cs_);
+        native_quantize_q8_1(b.sample_, xq2_ + col_bytes_, (int) N, 1, cs_);
+        native_mmvq_head(a.head_->type(), a.head_->weights(), xq2_, logits2_, (int) N, (int) nv_, 2, cs_);
+        ok = a.record_post_head(logits2_, cs_, err) && b.record_post_head(logits2_ + nv_, cs_, err);
+        if (ok) {
+            mtp_select(a.R_, HCN, a.out_ids_, a.row_ + 1, a.Rin_, a.tok_, a.m_out_, j, cs_, a.probs_, a.m_prob_);
+            mtp_select(b.R_, HCN, b.out_ids_, b.row_ + 1, b.Rin_, b.tok_, b.m_out_, j, cs_, b.probs_, b.m_prob_);
+        }
+            return ok;
+        };
+        ok = record_round(0, T0) && record_round(1, T1) && record_tail(0) &&
+             record_step(0, 1) && record_step(1, 1) && record_tail(1);
+    } catch (const std::exception& e) {
+        err = std::string("mtp pair whole depth2 capture: ") + e.what();
+        ok = false;
+    }
+    return finish_capture(cs_, ok, exec, "whole pair depth2", err, true);
+} catch (const std::exception& e) {
+    err = std::string("mtp pair whole depth2 capture: ") + e.what();
+    try { if (cs_) cs_->wait(); } catch (...) {}
+    return false; // No component/solo fallback after an uncertain capture failure.
+}
+
+bool MtpPair::draft(const Args& A, const Args& B, std::string& err) try {
+    host_boundary::mark("pair_enter", A.T, B.T);
+    std::string why;
+    if (!eligible(A, B, why)) { err = "mtp pair: " + why; return false; }
+    const OnDevice on_device(d_[0]->device_);
+    const Args* args[2] = {&A, &B};
+    int T[2] = {A.T, B.T};
+    // #783 PR-i as draft(): the round runs for the cells up to the accepted row (T = a + 1) unless catch-up-all
+    if (!mtp_catchup_all()) { T[0] = A.a + 1; T[1] = B.a + 1; }
+    const int max_steps = steps_of(*d_[0], A.p, A.a);   // eligible(): equal for both, >= 1
+    // the graphs (cached; a capture syncs the pair queue), then both slots' own queues idle: the pair queue reads
+    // what their last solo launches wrote
+    const bool whole_pair = !owner_queues_ && max_steps == 2 && pair_graph_depth2_on();
+    if (whole_pair) {
+        if (!capture_pair_depth2(T[0], T[1], err)) { drain_owner_queues(); return false; }
+        if (!pair_graph_marked_) {
+            std::fprintf(stderr, "strata MTP pair graph: enabled=1 depth=2 rerecorded=1 T0=%d T1=%d host-selection-only\n", T[0], T[1]);
+            pair_graph_marked_ = true;
+        }
+    } else {
+    for (int c = 0; c < 2; ++c)
+        if (!capture_pre_round(c, T[c], err)) { drain_owner_queues(); return false; }
+    for (int j = 1; j < max_steps; ++j)
+        for (int c = 0; c < 2; ++c)
+            if (!capture_pre_step(c, j, err)) { drain_owner_queues(); return false; }
+    for (int j = 0; j < max_steps; ++j)
+        if (!capture_tail(j, err)) { drain_owner_queues(); return false; }
+    }
+    if (owner_queues_ && !owner_queues_marked_) {
+        std::fprintf(stderr, "strata MTP owner queues: enabled=1 same-device=1 host-joins=1 whole-pair-graph=0 host-selection-only\n");
+        owner_queues_marked_ = true;
+    }
+    host_boundary::mark("pair_capture_ready", T[0], T[1]);
+    if (owner_queues_) {
+        // Readiness is not the noexcept cleanup drain: propagate errors before mapped staging.
+        for (MtpDrafter* d : d_) {
+            d->cs_->wait_and_throw();
+            if (d->side_ && d->side_ != d->cs_) d->side_->wait_and_throw();
+        }
+    } else {
+    for (int c = 0; c < 2; ++c)
+        if (!d_[c]->idle(err)) return false;
+    }
+    host_boundary::mark("pair_idle_done", T[0], T[1]);
+    const Clock::time_point t0 = Clock::now();
+    // ---- the staging, per slot exactly as draft(): its own mapped records and outputs
+    for (int c = 0; c < 2; ++c) {
+        MtpDrafter& d = *d_[c];
+        const Args& x = *args[c];
+        const int64_t NH = d.g_->n_head;
+        auto put = [&](int row, int64_t cell) {
+            d.h_step_[row * 4 + 0] = (int32_t) cell;
+            d.h_step_[row * 4 + 1] = (int32_t) (cell + 1);
+            d.h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
+            d.h_step_[row * 4 + 3] = (int32_t) (cell + 1);
+            for (int64_t h = 0; h < NH; ++h) d.h_pos_[row * NH + h] = (int32_t) cell;
+        };
+        for (int t = 0; t < T[c]; ++t) {
+            d.h_tok_[t] = x.tokens[t];
+            put(t, x.p + t);
+        }
+        put(2 * d.max_t_ - 1, coupled_draft_cell(x.p, x.a, 0));   // p + a: draft 0's cell
+        for (int j = 1; j < max_steps; ++j)
+            put(d.max_t_ + j - 1, coupled_draft_cell(x.p, x.a, j));
+        for (int j = 0; j < max_steps; ++j) ((volatile int32_t*) d.h_out_)[j] = -1;
+        d.h_row_[0] = x.a;
+        d.h_row_[1] = 0;
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    host_boundary::mark("pair_inputs_ready", max_steps);
+    // CPU-only PLE hint state; forwards have no GPU PLE host-service requests.
+    SessionState* pss[2];
+    bool do_ple[2];
+    int32_t ple_prev[2][2];
+    for (int c = 0; c < 2; ++c) {
+        MtpDrafter& d = *d_[c];
+        pss[c] = d.ple_ss_ ? d.ple_ss_ : d.ss_;
+        do_ple[c] = pss[c] != nullptr && pss[c]->ple.table != nullptr && pss[c]->ple.table->is_open();
+        ple_prev[c][0] = do_ple[c] ? pss[c]->ple_prev[0] : 0;
+        ple_prev[c][1] = do_ple[c] ? pss[c]->ple_prev[1] : 0;
+    }
+    auto prefetch_ple = [&](int c, int32_t tok) {
+        if (!do_ple[c] || tok < 0) return;
+        uint32_t rows16[strata::kernels::PLE_N_HEADS];
+        strata::kernels::ngram_rows(&tok, ple_prev[c], 1, pss[c]->ple.consts, rows16);
+        ple_prev[c][0] = ple_prev[c][1];
+        ple_prev[c][1] = tok;
+        pss[c]->ple.table->prefetch_rows(rows16);
+    };
+    // ---- the launches, all on the pair queue: both rounds, their shared tail, then per depth both steps and their tail
+    auto launch = [&](dpct::experimental::command_graph_exec_ptr g, const char* what) {
+        if (g == nullptr || DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*g)) != 0) {
+            err = std::string("mtp pair: ") + what + " launch failed";
+            return false;
+        }
+        return true;
+    };
+    host_boundary::mark("pair_submit_begin", max_steps);
+    bool ok = [&] {
+        if (owner_queues_) {
+            auto launch_owner = [&](int c, dpct::experimental::command_graph_exec_ptr g) {
+                if (g == nullptr || DPCT_CHECK_ERROR(d_[c]->cs_->ext_oneapi_graph(*g)) != 0) {
+                    err = "mtp pair: owner forward launch failed";
+                    return false;
+                }
+                return true;
+            };
+            for (int j = 0; j < max_steps; ++j) {
+                // The previous tail is complete before either owner reads its next token/residual.
+                auto ga = j == 0 ? pre_round_[0][T[0]] : pre_step_[0][j];
+                auto gb = j == 0 ? pre_round_[1][T[1]] : pre_step_[1][j];
+                if (!launch_owner(0, ga) || !launch_owner(1, gb)) return false;
+                if (j == 0)
+                    for (int c = 0; c < 2; ++c) prefetch_ple(c, args[c]->tokens[args[c]->a]);
+                // Both forwards complete before the unchanged primary tail reads either sample_.
+                d_[0]->cs_->wait_and_throw();
+                d_[1]->cs_->wait_and_throw();
+                if (!launch(tail_[j], "owner-queue head")) return false;
+                cs_->wait_and_throw();
+                for (int c = 0; c < 2; ++c) {
+                    const int32_t tok = ((volatile int32_t*) d_[c]->h_out_)[j];
+                    if (tok < 0) { err = "mtp pair: completed owner tail output missing owner=" + std::to_string(c) + " depth=" + std::to_string(j); return false; }
+                    prefetch_ple(c, tok);
+                }
+            }
+            return true;
+        }
+        if (whole_pair) return launch(pair_exec_[T[0]][T[1]], "whole pair depth2");
+    bool ok = launch(pre_round_[0][T[0]], "round A") && launch(pre_round_[1][T[1]], "round B") && launch(tail_[0], "head 0");
+    for (int j = 1; ok && j < max_steps; ++j)
+        ok = launch(pre_step_[0][j], "step A") && launch(pre_step_[1][j], "step B") && launch(tail_[j], "head");
+        return ok;
+    }();
+    if (!ok) {   // the slots' K/V may already be written: drain and report, the caller must not draft again
+        drain_owner_queues();
+        try { cs_->wait(); } catch (...) {}
+        return false;
+    }
+    (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty()));
+    host_boundary::mark("pair_submit_end", max_steps);
+    // ---- the outputs, per slot as draft(): its own mapped h_out_ polled in depth order, its own PLE prefetch
+    auto wait_out = [&](int c, int j) {
+        uint32_t spins = 0;
+        while (((volatile int32_t*) d_[c]->h_out_)[j] < 0) {
+#if defined(_WIN32) || defined(__x86_64__)
+            _mm_pause();
+#endif
+            if ((++spins & 1023u) == 0 && ((cs_)->ext_oneapi_empty() ? 0 : 1) != 1) break;
+        }
+    };
+    host_boundary::mark("pair_poll_begin", max_steps);
+    if (!owner_queues_)
+        for (int c = 0; c < 2; ++c) prefetch_ple(c, args[c]->tokens[args[c]->a]);
+    for (int j = 0; j + 1 < max_steps; ++j)
+        for (int c = 0; c < 2; ++c) {
+            wait_out(c, j);
+            args[c]->drafts[j] = ((volatile int32_t*) d_[c]->h_out_)[j];
+            if (!owner_queues_) prefetch_ple(c, args[c]->drafts[j]);
+        }
+    host_boundary::mark("pair_wait_begin", max_steps);
+    if (DPCT_CHECK_ERROR(cs_->wait()) != 0) { err = "mtp pair: the draft queue failed"; drain_owner_queues(); return false; }
+    host_boundary::mark("pair_wait_done", max_steps);
+    const int last = max_steps - 1;
+    for (int c = 0; c < 2; ++c) {
+        MtpDrafter& d = *d_[c];
+        const Args& x = *args[c];
+        x.drafts[last] = ((volatile int32_t*) d.h_out_)[last];
+        if (!owner_queues_) prefetch_ple(c, x.drafts[last]);
+        for (int j = max_steps; j < d.max_t_ - 1; ++j) x.drafts[j] = 0;
+        if (x.n_drafts) *x.n_drafts = max_steps;
+        d.ms_draft += ms_since(t0);
+        ++d.rounds;
+    }
+    host_boundary::mark("pair_return", max_steps);
+    return true;
+} catch (sycl::exception const& e) {
+    drain_owner_queues(); // ON: finish every possible writer before allocating the error string.
+    err = std::string("mtp pair: ") + e.what();
+    try { if (cs_) cs_->wait(); } catch (...) {}
+    return false;
+} catch (std::exception const& e) {
+    if (!owner_queues_) throw; // Preserve the original OFF behavior for non-SYCL exceptions.
+    drain_owner_queues();
+    err = std::string("mtp pair owner queues: ") + e.what();
+    return false;
 }
 
 }  // namespace strata::core
