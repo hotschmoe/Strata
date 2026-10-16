@@ -41,6 +41,13 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
                          const int32_t* n_keep, void* stream, int t_out_begin = 0, void* xq_out = nullptr);
+/// night-lab STRATA_NIGHT_GDN_SLOTS (default off): gdn_step_norm_multi's verify form (n_keep null, every row's output,
+/// no q8 image) for up to 4 slot groups in one launch; slot i: state states[i], rows [row0[i], row0[i] + nrows[i]) of
+/// h / gate / beta / z / y. Bitwise the per-slot calls. False (nothing launched) when it does not apply.
+bool night_gdn_slots_enabled();
+bool night_gdn_step_norm_slots(float* const* states, const int* row0, const int* nrows, int nslots, const float* h,
+                               int conv_channels, const float* gate, const float* beta, const float* z,
+                               const float* gamma, float eps, float* y, int h_k, int h_v, void* stream);
 /// The commit of `n_layers` GDN layers in two launches (engine-latency): layer i's conv history is
 /// `state + i * state_stride + conv_off` and its qkv rows `qkv + i * qkv_stride`, as gdn_conv_commit; its recurrence
 /// state `state + i * state_stride` over the first *n_keep rows of `h + i * h_stride` / `gate|beta + i * gb_stride`, as

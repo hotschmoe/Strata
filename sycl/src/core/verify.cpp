@@ -1100,7 +1100,22 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                 native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, cs);
                 stamp(l, 5, grp);
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
-                if (batch_rec_) {   // each slot's recurrence over its own proposed-token group
+                bool night_slots_done = false;
+                if (batch_rec_ && night_gdn_slots_enabled()) {   // night-lab: every slot group in one launch (bitwise)
+                    float* st4[4] = {}; int r4[4] = {}, n4[4] = {}; int ns = 0;
+                    for (int t = tb; t < te;) {
+                        const int first = t;
+                        while (t < te && brow_[t] == brow_[first]) ++t;
+                        if (ns == 4) { ns = 5; break; }
+                        SessionState& sx = slot_ss(first);
+                        st4[ns] = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats; r4[ns] = first; n4[ns] = t - first; ++ns;
+                    }
+                    if (ns >= 1 && ns <= 4)
+                        night_slots_done = night_gdn_step_norm_slots(st4, r4, n4, ns, hb, (int) C, gate, beta, z_,
+                                                                     (const float*) wnm->data, EPS, y_, (int) HK, (int) HV, cs);
+                }
+                if (night_slots_done) {
+                } else if (batch_rec_) {   // each slot's recurrence over its own proposed-token group
                     for (int t = tb; t < te;) {
                         const int first = t;
                         while (t < te && brow_[t] == brow_[first]) ++t;
