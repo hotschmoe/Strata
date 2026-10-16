@@ -33,6 +33,10 @@ void gdn_conv_ab_multi(const float* history, const float* qkv, const float* conv
                        float eps, int n_tok, int t_begin, bool commit, const float* x, const uint16_t* w_alpha,
                        const uint16_t* w_beta, const float* dt, const float* ssm_a, float* gate, float* beta, int n_embd,
                        int h_v, void* stream);
+/// night lab bench: STRATA_NIGHT_GDN_GRF (1 on, 0 off, -1 the environment; set before capture)
+void gdn_grf_set_night(int on);
+/// night lab bench: STRATA_NIGHT_GDN_AB (1 on, 0 off, -1 the environment; set before capture)
+void gdn_ab_set_night(int on);
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream);
 /// The recurrence + output norm for T tokens (h = (T, conv_channels) as q|k|v, gate/beta (T, h_v), z/y

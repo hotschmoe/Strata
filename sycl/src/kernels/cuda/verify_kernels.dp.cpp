@@ -4,6 +4,7 @@
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include "strata/core/geometry.hpp"
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
@@ -219,6 +220,58 @@ __dpct_inline__ void gdn_ab_multi_kernel(
             const float sp = v > 20.0f ? v : sycl::log1p(sycl::native::exp(v));
             gate[(size_t) t * h_v + r] = sp * ssm_a[r];
         }
+    }
+}
+
+// night lab STRATA_NIGHT_GDN_AB=1 (default off): gdn_ab_multi with one sub-group per (row, token) instead of one per
+// row looping over the tokens: T x more sub-groups in flight (96 at most before: ~3% of the card), each lane's chunk
+// order, FMA chain, xor tree and epilogue unchanged - bitwise the same gate / beta.  Loads of two chunks are issued
+// ahead of their FMAs (the chain itself stays sequential).
+__dpct_inline__ void gdn_ab_night_kernel(const float *__restrict__ x, const uint16_t *__restrict__ wa,
+                                         const uint16_t *__restrict__ wb, const float *__restrict__ dt,
+                                         const float *__restrict__ ssm_a, float *__restrict__ gate,
+                                         float *__restrict__ beta, int n, int h_v) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int row = item_ct1.get_group(2) * 2 + (item_ct1.get_local_id(2) >> 5), lane = item_ct1.get_local_id(2) & 31;
+    const int t = item_ct1.get_group(1);
+    if (row >= 2 * h_v) return;
+    const bool is_beta = row >= h_v;
+    const int r = is_beta ? row - h_v : row;
+    const sycl::uint4 *w4 = reinterpret_cast<const sycl::uint4 *>((is_beta ? wb : wa) + (size_t) r * n);
+    const float* xt = x + (size_t) t * n;
+    float a = 0.0f;
+    auto step = [&](const sycl::uint4& wv, const sycl::float4& xa, const sycl::float4& xb) {
+        a = sycl::fma(sycl::bit_cast<float>(wv.x() << 16), xa.x(), a);
+        a = sycl::fma(sycl::bit_cast<float>(wv.x() & 0xffff0000u), xa.y(), a);
+        a = sycl::fma(sycl::bit_cast<float>(wv.y() << 16), xa.z(), a);
+        a = sycl::fma(sycl::bit_cast<float>(wv.y() & 0xffff0000u), xa.w(), a);
+        a = sycl::fma(sycl::bit_cast<float>(wv.z() << 16), xb.x(), a);
+        a = sycl::fma(sycl::bit_cast<float>(wv.z() & 0xffff0000u), xb.y(), a);
+        a = sycl::fma(sycl::bit_cast<float>(wv.w() << 16), xb.z(), a);
+        a = sycl::fma(sycl::bit_cast<float>(wv.w() & 0xffff0000u), xb.w(), a);
+    };
+    int j = lane;
+    for (; j + 32 < n / 8; j += 64) {
+        const sycl::uint4 w0 = w4[j], w1 = w4[j + 32];
+        const sycl::float4 x0a = *reinterpret_cast<const sycl::float4 *>(xt + j * 8);
+        const sycl::float4 x0b = *reinterpret_cast<const sycl::float4 *>(xt + j * 8 + 4);
+        const sycl::float4 x1a = *reinterpret_cast<const sycl::float4 *>(xt + (j + 32) * 8);
+        const sycl::float4 x1b = *reinterpret_cast<const sycl::float4 *>(xt + (j + 32) * 8 + 4);
+        step(w0, x0a, x0b);
+        step(w1, x1a, x1b);
+    }
+    for (; j < n / 8; j += 32)
+        step(w4[j], *reinterpret_cast<const sycl::float4 *>(xt + j * 8), *reinterpret_cast<const sycl::float4 *>(xt + j * 8 + 4));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        a += dpct::experimental::permute_sub_group_by_xor(0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(), a, o);
+    if (lane != 0) return;
+    if (is_beta) {
+        beta[(size_t) t * h_v + r] = 1.0f / (1.0f + sycl::native::exp(-a));
+    } else {
+        const float v = a + dt[r];
+        const float sp = v > 20.0f ? v : sycl::log1p(sycl::native::exp(v));
+        gate[(size_t) t * h_v + r] = sp * ssm_a[r];
     }
 }
 
@@ -1747,6 +1800,19 @@ bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, con
     return true;
 }
 
+namespace {
+int g_night_gdn_ab_force = -1;   // the bench: >= 0 overrides the environment
+bool night_gdn_ab() {
+    static const bool env = [] {
+        const char* v = std::getenv("STRATA_NIGHT_GDN_AB");
+        const bool b = v != nullptr && v[0] == '1';
+        if (b) std::fprintf(stderr, "strata night: STRATA_NIGHT_GDN_AB=1 (gdn_ab_multi: a sub-group per row and token)\n");
+        return b;
+    }();
+    return g_night_gdn_ab_force >= 0 ? g_night_gdn_ab_force != 0 : env;
+}
+}  // namespace
+void gdn_ab_set_night(int on) { g_night_gdn_ab_force = on; }
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream) {
     if (n_embd % 8 != 0 || n_tok < 1 || n_tok > kVerifyMaxT) {
@@ -1755,6 +1821,15 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
     }
     const unsigned blocks = (unsigned) ((2 * h_v + 1) / 2);
     dpct::queue_ptr st = strata::q_of(stream);
+    if (night_gdn_ab()) {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+        st->parallel_for<dpct_kernel_name<class gdn_ab_night>>(
+            sycl::nd_range<3>(sycl::range(1, (unsigned) n_tok, blocks) * sycl::range(1, 1, 64), sycl::range(1, 1, 64)),
+            exp_props, [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                gdn_ab_night_kernel(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v);
+            });
+        return;
+    }
     switch (n_tok) {
     case 1: {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
@@ -1882,6 +1957,21 @@ __dpct_inline__ auto gdn_slot_pick(const GdnSlotArgs& a, int s) {
     else { int v = a.n[0]; v = s == 1 ? a.n[1] : v; v = s == 2 ? a.n[2] : v; v = s == 3 ? a.n[3] : v; return v; }
 }
 }  // namespace
+// night lab STRATA_NIGHT_GDN_GRF=1 (default off): the per-slot verify recurrence (gdn_step_norm_multi_kernel<true, *>,
+// the C1 window's path) compiled with 256 GRF: at 128 GRF IGC spills 704-1152 bytes per thread (32 state rows x SIMD32
+// = 64 GRF of state alone).  Same code: bitwise.  Not used for the GDN_SLOTS launch (2 slots: 96 work-groups of 512
+// threads; at 256 GRF the halved occupancy made it 1-12% slower, ep_night_bench gdnstep).
+int g_night_gdn_grf_force = -1;
+bool night_gdn_grf() {
+    static const bool env = [] {
+        const char* e = std::getenv("STRATA_NIGHT_GDN_GRF");
+        const bool on = e != nullptr && e[0] == '1';
+        if (on) std::fprintf(stderr, "strata night: STRATA_NIGHT_GDN_GRF=1 (GDN verify recurrence with 256 GRF, no spills)\n");
+        return on;
+    }();
+    return g_night_gdn_grf_force >= 0 ? g_night_gdn_grf_force != 0 : env;
+}
+void gdn_grf_set_night(int on) { g_night_gdn_grf_force = on; }
 bool night_gdn_slots_enabled() {
     static const bool v = [] {
         const char* e = std::getenv("STRATA_NIGHT_GDN_SLOTS");
@@ -2060,6 +2150,15 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         the limit. To get the device limit, query
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
+        if (all_out && night_gdn_grf()) {
+            strata::q_of(stream)->parallel_for<dpct_kernel_name<class gdn_step_norm_multi_grf, dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(g1 * b1, b1),
+                sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>},
+                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                    gdn_step_norm_multi_kernel<true, true>(state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k,
+                                                           h_v, n_tok, nullptr, 0, xq);
+                });
+        } else
         if (all_out) {
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
@@ -2098,6 +2197,14 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
                                 xq);
                         });
         }
+    } else if (all_out && night_gdn_grf()) {
+        strata::q_of(stream)->parallel_for<dpct_kernel_name<class gdn_step_norm_multi_grf, dpct_kernel_scalar<false>>>(
+            sycl::nd_range<3>(g1 * b1, b1),
+            sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>},
+            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                gdn_step_norm_multi_kernel<true, false>(state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v,
+                                                        n_tok, nullptr, 0, nullptr);
+            });
     } else if (all_out) {
         /*
         DPCT1049: The work-group size passed to the SYCL kernel may exceed

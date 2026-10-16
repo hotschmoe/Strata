@@ -29,6 +29,8 @@
 #include <cfloat>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace strata::kernels {
@@ -216,6 +218,111 @@ __dpct_inline__ void route_multi(const float *__restrict__ logits,
     const float inverse_selected_sum = 1.0f / selected_sum;
     if (lane < 10) weights[lane] = selected * inverse_selected_sum;
 }
+// ---- night lab STRATA_NIGHT_TOPK10=1 (default off): route<NE> with the same prologue (softmax bits) and the same
+// selection, but no dynamic register-array indexing and a short dependency chain per round: each lane keeps its
+// best (first maximum = lowest id on ties, as the 15-step scan) from a 4-level tree, and only the round's winning lane
+// clears its entry (statically unrolled selects) and recomputes it; the cross-lane (value, id) tree, ids[rank],
+// the winner lanes' selected_sum order and the final warp_sum are unchanged: bitwise the same ids and weights.
+// the same xor trees as warp_sum / warp_max, through the SPIR-V ShuffleXor (constant mask) instead of dpct's generic
+// shuffle with a computed lane id (IGC lowers that to an a0-indirect gather: ~14 movs per shuffle in route<512>)
+__dpct_inline__ float night_warp_sum(sycl::sub_group sg, float value) {
+#pragma unroll
+    for (int mask = 16; mask; mask >>= 1) value += sycl::permute_group_by_xor(sg, value, mask);
+    return value;
+}
+__dpct_inline__ float night_warp_max(sycl::sub_group sg, float value) {
+#pragma unroll
+    for (int mask = 16; mask; mask >>= 1) value = sycl::fmax(value, sycl::permute_group_by_xor(sg, value, mask));
+    return value;
+}
+template <int NE>
+__dpct_inline__ void lane_best(const float (&v)[NE / 32], int lane, float& best, int& expert) {
+    constexpr int N = NE / 32;
+    float bv[N];
+    int bi[N];
+#pragma unroll
+    for (int i = 0; i < N; ++i) { bv[i] = v[i]; bi[i] = i; }
+#pragma unroll
+    for (int w = 1; w < N; w *= 2)
+#pragma unroll
+        for (int i = 0; i + w < N; i += 2 * w)
+            {   // strict: the lower index keeps ties
+                const bool take = bv[i + w] > bv[i];
+                bv[i] = take ? bv[i + w] : bv[i];
+                bi[i] = take ? bi[i + w] : bi[i];
+            }
+    best = bv[0];
+    expert = lane + bi[0] * 32;
+}
+template <int NE>
+__dpct_inline__ void route_night(const float *__restrict__ logits, int32_t *__restrict__ ids,
+                                 float *__restrict__ weights) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    logits += (size_t)item_ct1.get_group(2) * NE;
+    ids += (size_t)item_ct1.get_group(2) * 10;
+    weights += (size_t)item_ct1.get_group(2) * 10;
+    if (item_ct1.get_local_id(1) != 0) return;
+    const int lane = item_ct1.get_local_id(2);
+    float values[NE / 32];
+#pragma unroll
+    for (int i = 0; i < NE / 32; ++i) values[i] = logits[lane + i * 32];
+    sycl::group_barrier(item_ct1.get_sub_group());
+    float maximum = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < NE / 32; ++i) maximum = sycl::max(maximum, values[i]);
+    maximum = night_warp_max(item_ct1.get_sub_group(), maximum);
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < NE / 32; ++i) {
+        values[i] = sycl::native::exp(values[i] - maximum);
+        sum += values[i];
+    }
+    const float reciprocal = 1.0f / night_warp_sum(item_ct1.get_sub_group(), sum);
+#pragma unroll
+    for (int i = 0; i < NE / 32; ++i) {
+        values[i] *= reciprocal;
+        if (sycl::isnan(values[i])) values[i] = -FLT_MAX;
+    }
+    float lb;
+    int le;
+    lane_best<NE>(values, lane, lb, le);
+    float selected = 0.0f, selected_sum = 0.0f;
+#pragma unroll
+    for (int rank = 0; rank < 10; ++rank) {
+        float best = lb;
+        int expert = le;
+#pragma unroll
+        for (int mask = 16; mask; mask >>= 1) {
+            const float other = sycl::permute_group_by_xor(item_ct1.get_sub_group(), best, mask);
+            const int other_id = sycl::permute_group_by_xor(item_ct1.get_sub_group(), expert, mask);
+            const bool take = (other > best) | ((other == best) & (other_id < expert));   // branch-free, same rule
+            best = take ? other : best;
+            expert = take ? other_id : expert;
+        }
+        if ((expert & 31) == lane) {
+            const int slot = expert >> 5;
+#pragma unroll
+            for (int i = 0; i < NE / 32; ++i) values[i] = i == slot ? -INFINITY : values[i];
+            ids[rank] = expert;
+            selected_sum += best;
+            lane_best<NE>(values, lane, lb, le);
+        }
+        if (rank == lane) selected = best;
+    }
+    selected_sum = sycl::max(night_warp_sum(item_ct1.get_sub_group(), selected_sum), 6.103515625e-5f);
+    const float inverse_selected_sum = 1.0f / selected_sum;
+    if (lane < 10) weights[lane] = selected * inverse_selected_sum;
+}
+int g_night_topk_force = -1;   // the bench: >= 0 overrides the environment (set before capture)
+bool night_topk10() {
+    static const bool env = [] {
+        const char* v = std::getenv("STRATA_NIGHT_TOPK10");
+        const bool b = v != nullptr && v[0] == '1';
+        if (b) std::fprintf(stderr, "strata night: STRATA_NIGHT_TOPK10=1 (router top-10 without dynamic indexing)\n");
+        return b;
+    }();
+    return g_night_topk_force >= 0 ? g_night_topk_force != 0 : env;
+}
 bool valid(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);
     return p && address % 4 == 0 && bytes <= UINTPTR_MAX - address;
@@ -226,6 +333,7 @@ bool overlap(const void* a, size_t an, const void* b, size_t bn) {
 }
 }
 void native_router_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
+void native_router_set_night_topk(int on) { g_night_topk_force = on; }
 bool native_router_enabled() { return enabled.load(std::memory_order_relaxed); }
 void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream) {
     if (!stream || !valid(logits, 512 * 4) || !valid(ids, 10 * 4) || !valid(weights, 10 * 4)
@@ -236,6 +344,13 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
+        if (night_topk10()) {
+            ((sycl::queue *)(strata::q_of(stream)))
+                ->parallel_for<dpct_kernel_name<class route_512_night>>(
+                    sycl::nd_range<3>(sycl::range(1, 8, 32), sycl::range(1, 8, 32)), exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] { route_night<512>(logits, ids, weights); });
+            return;
+        }
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<dpct_kernel_name<class route_96e6fb>>(
                 sycl::nd_range<3>(sycl::range(1, 8, 32), sycl::range(1, 8, 32)),
@@ -273,6 +388,13 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
     // SYCL port: one block per token running the single-token route<512> (the same kernel as the 256-expert multi
     // launch below).  Upstream's one-warp-per-token route_multi gives the same bits (native_multi_parity checks
     // that) but hung an Arc A750 (Alchemist) on its first launch.
+    if (night_topk10()) {
+        ((sycl::queue *)(strata::q_of(stream)))
+            ->parallel_for<dpct_kernel_name<class route_512_multi_night>>(
+                sycl::nd_range<3>(sycl::range(1, 1, (unsigned) n_tok) * sycl::range(1, 8, 32), sycl::range(1, 8, 32)),
+                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] { route_night<512>(logits, ids, weights); });
+        return;
+    }
     ((sycl::queue *)(strata::q_of(stream)))
         ->parallel_for<dpct_kernel_name<class route_512_multi>>(
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned) n_tok) * sycl::range(1, 8, 32), sycl::range(1, 8, 32)),
@@ -304,6 +426,13 @@ void native_router_top10_multi_ne(const float* logits, int32_t* ids, float* weig
     if (!stream || n_tok < 1 || n_expert != 256 || !valid(logits, (size_t) n_tok * 256 * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
         !valid(weights, (size_t) n_tok * 10 * 4))
         throw std::invalid_argument("native router (multi, 256): a stream, 256 experts and aligned [n,256]/[n,10] buffers");
+    if (night_topk10()) {
+        ((sycl::queue *)(strata::q_of(stream)))
+            ->parallel_for<dpct_kernel_name<class route_256_multi_night>>(
+                sycl::nd_range<3>(sycl::range(1, 1, (unsigned) n_tok) * sycl::range(1, 8, 32), sycl::range(1, 8, 32)),
+                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] { route_night<256>(logits, ids, weights); });
+        return;
+    }
     ((sycl::queue *)(strata::q_of(stream)))
         ->parallel_for<dpct_kernel_name<class route_256_multi>>(
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned) n_tok) * sycl::range(1, 8, 32), sycl::range(1, 8, 32)),

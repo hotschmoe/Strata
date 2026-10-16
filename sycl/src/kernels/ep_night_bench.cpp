@@ -13,6 +13,8 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/ep_kernels.hpp"
+#include "strata/kernels/native_router.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -470,6 +472,190 @@ int plan_bench(int reps) {
     return fails ? 1 : 0;
 }
 
+// ------------------------------------------------------------------------------------------------ router (TOPK10)
+int router_bench(int reps) {
+    sycl::queue& q = Q();
+    std::mt19937 rng(5150);
+    const int NE = 512, MAXT = 8, TRIALS = 400;
+    float* d_l = sycl::malloc_device<float>((size_t) MAXT * NE * 48, q);
+    int32_t* d_i[2];
+    float* d_w[2];
+    for (int v = 0; v < 2; ++v) { d_i[v] = sycl::malloc_device<int32_t>(MAXT * 10 * 48, q); d_w[v] = sycl::malloc_device<float>(MAXT * 10 * 48, q); }
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::uniform_int_distribution<int> pick(0, NE - 1);
+    int bad = 0;
+    long checked = 0;
+    for (int trial = 0; trial < TRIALS; ++trial) {
+        const int T = 1 + trial % MAXT;
+        std::vector<float> l((size_t) T * NE);
+        const int kind = trial % 5;
+        for (auto& v : l) v = (kind == 0 ? 0.5f : kind == 1 ? 3.0f : 1.5f) * nd(rng);
+        if (kind == 2) for (auto& v : l) v = std::round(v * 4.0f) / 4.0f;   // many exact ties
+        if (kind == 3) for (int t = 0; t < T; ++t) for (int k = 0; k < 40; ++k) l[(size_t) t * NE + pick(rng)] = 2.5f;   // tied leaders
+        if (kind == 4) for (int t = 0; t < T; ++t) for (int k = 0; k < NE; ++k) l[(size_t) t * NE + k] = (k % 7 == 0) ? 1.0f : -1.0f;
+        q.memcpy(d_l, l.data(), l.size() * 4).wait();
+        std::vector<int32_t> ids[2];
+        std::vector<float> w[2];
+        for (int v = 0; v < 2; ++v) {
+            q.memset(d_i[v], 0xFF, MAXT * 40).wait();
+            q.memset(d_w[v], 0xFF, MAXT * 40).wait();
+            k::native_router_set_night_topk(v);
+            if (T == 1 && trial % 2) k::native_router_top10(d_l, d_i[v], d_w[v], &q);
+            else k::native_router_top10_multi(d_l, d_i[v], d_w[v], T, &q);
+            q.wait();
+            ids[v].resize((size_t) T * 10); w[v].resize((size_t) T * 10);
+            q.memcpy(ids[v].data(), d_i[v], (size_t) T * 40).wait();
+            q.memcpy(w[v].data(), d_w[v], (size_t) T * 40).wait();
+        }
+        k::native_router_set_night_topk(-1);
+        checked += T;
+        if (std::memcmp(ids[0].data(), ids[1].data(), (size_t) T * 40) || std::memcmp(w[0].data(), w[1].data(), (size_t) T * 40)) {
+            if (bad < 5) std::printf("router trial %d (T=%d kind %d): DIFF ids0 %d ids1 %d\n", trial, T, kind, ids[0][0], ids[1][0]);
+            ++bad;
+        }
+    }
+    std::printf("router top-10: %ld token rows (ties, flat, wide, tied leaders), night vs default ids+weights bitwise: %s\n",
+                checked, bad ? "FAIL" : "equal");
+    for (int T : {1, 4, 6, 8}) {
+        double t[2];
+        for (int v = 0; v < 2; ++v) {
+            k::native_router_set_night_topk(v);
+            t[v] = time_graph_us(q, [&] { for (int i = 0; i < 48; ++i) k::native_router_top10_multi(d_l + (size_t) i * MAXT * NE, d_i[v] + i * MAXT * 10, d_w[v] + i * MAXT * 10, T, &q); }, 48, reps);
+        }
+        k::native_router_set_night_topk(-1);
+        std::printf("router top-10 T=%d: default %.2f us, night %.2f us per call (48 in a graph)\n", T, t[0], t[1]);
+    }
+    sycl::free(d_l, q);
+    for (int v = 0; v < 2; ++v) { sycl::free(d_i[v], q); sycl::free(d_w[v], q); }
+    return bad ? 1 : 0;
+}
+
+// ------------------------------------------------------------------------------------------------ gdnab (GDN_AB)
+int gdnab_bench(int reps) {
+    sycl::queue& q = Q();
+    std::mt19937 rng(77);
+    const int n = 2560, hv = 48, MAXT = 8, NL = 36;
+    std::normal_distribution<float> nd(0.f, 1.f);
+    auto bf16 = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return (uint16_t) ((u + 0x7FFF + ((u >> 16) & 1)) >> 16); };
+    std::vector<uint16_t> wa((size_t) NL * hv * n), wb((size_t) NL * hv * n);
+    for (auto& v : wa) v = bf16(0.05f * nd(rng));
+    for (auto& v : wb) v = bf16(0.05f * nd(rng));
+    std::vector<float> x((size_t) MAXT * n), dt(hv), sa(hv);
+    for (auto& v : x) v = nd(rng);
+    for (auto& v : dt) v = nd(rng);
+    for (auto& v : sa) v = -std::fabs(nd(rng));
+    uint16_t* d_wa = sycl::malloc_device<uint16_t>(wa.size(), q);
+    uint16_t* d_wb = sycl::malloc_device<uint16_t>(wb.size(), q);
+    float* d_x = sycl::malloc_device<float>(x.size(), q);
+    float* d_dt = sycl::malloc_device<float>(hv, q);
+    float* d_sa = sycl::malloc_device<float>(hv, q);
+    float* d_g[2]; float* d_b[2];
+    for (int v = 0; v < 2; ++v) { d_g[v] = sycl::malloc_device<float>(MAXT * hv, q); d_b[v] = sycl::malloc_device<float>(MAXT * hv, q); }
+    q.memcpy(d_wa, wa.data(), wa.size() * 2); q.memcpy(d_wb, wb.data(), wb.size() * 2);
+    q.memcpy(d_x, x.data(), x.size() * 4); q.memcpy(d_dt, dt.data(), hv * 4); q.memcpy(d_sa, sa.data(), hv * 4); q.wait();
+    int bad = 0;
+    for (int T = 1; T <= MAXT; ++T)
+        for (int layer : {0, 13, 35}) {
+            std::vector<float> g[2], b[2];
+            for (int v = 0; v < 2; ++v) {
+                q.memset(d_g[v], 0xFF, MAXT * hv * 4).wait(); q.memset(d_b[v], 0xFF, MAXT * hv * 4).wait();
+                k::gdn_ab_set_night(v);
+                k::gdn_ab_multi(d_x, d_wa + (size_t) layer * hv * n, d_wb + (size_t) layer * hv * n, d_dt, d_sa, d_g[v], d_b[v], n, hv, T, &q);
+                q.wait();
+                g[v].resize((size_t) T * hv); b[v].resize((size_t) T * hv);
+                q.memcpy(g[v].data(), d_g[v], (size_t) T * hv * 4).wait(); q.memcpy(b[v].data(), d_b[v], (size_t) T * hv * 4).wait();
+            }
+            if (std::memcmp(g[0].data(), g[1].data(), (size_t) T * hv * 4) || std::memcmp(b[0].data(), b[1].data(), (size_t) T * hv * 4)) {
+                ++bad; std::printf("gdn_ab T=%d layer %d: DIFF\n", T, layer);
+            }
+        }
+    k::gdn_ab_set_night(-1);
+    std::printf("gdn_ab_multi: night vs default gate+beta bitwise for T=1..8 x 3 weight sets: %s\n", bad ? "FAIL" : "equal");
+    for (int T : {1, 4, 6, 8}) {
+        double t[2];
+        for (int v = 0; v < 2; ++v) {
+            k::gdn_ab_set_night(v);
+            t[v] = time_graph_us(q, [&] { for (int l = 0; l < NL; ++l) k::gdn_ab_multi(d_x, d_wa + (size_t) l * hv * n, d_wb + (size_t) l * hv * n, d_dt, d_sa, d_g[v], d_b[v], n, hv, T, &q); }, NL, reps);
+        }
+        k::gdn_ab_set_night(-1);
+        std::printf("gdn_ab_multi T=%d: default %.2f us, night %.2f us per call (36 layers' weights in a graph)\n", T, t[0], t[1]);
+    }
+    for (void* p : {(void*) d_wa, (void*) d_wb, (void*) d_x, (void*) d_dt, (void*) d_sa, (void*) d_g[0], (void*) d_g[1], (void*) d_b[0], (void*) d_b[1]}) sycl::free(p, q);
+    return bad ? 1 : 0;
+}
+
+// ------------------------------------------------------------------------------------------------ gdnstep (GDN_GRF)
+int gdnstep_bench(int reps) {
+    sycl::queue& q = Q();
+    std::mt19937 rng(99);
+    const int hk = 16, hv = 48, S = 128, C = 2 * S * hk + S * hv, VD = S * hv, MAXT = 8, NL = 36, NS = 2;
+    const size_t st_floats = (size_t) hv * S * S;
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::uniform_real_distribution<float> u01(0.05f, 0.95f);
+    float* d_st = sycl::malloc_device<float>(st_floats * NL * NS, q);
+    {
+        std::vector<float> st(st_floats);
+        for (auto& v : st) v = 0.05f * nd(rng);
+        for (int i = 0; i < NL * NS; ++i) q.memcpy(d_st + st_floats * i, st.data(), st_floats * 4);
+        q.wait();
+    }
+    std::vector<float> h((size_t) MAXT * C), g(MAXT * hv), b(MAXT * hv), z((size_t) MAXT * VD), gam(S);
+    for (auto& v : h) v = 0.1f * nd(rng);
+    for (auto& v : g) v = -std::fabs(0.3f * nd(rng));
+    for (auto& v : b) v = u01(rng);
+    for (auto& v : z) v = nd(rng);
+    for (auto& v : gam) v = 1.0f + 0.1f * nd(rng);
+    float* d_h = sycl::malloc_device<float>(h.size(), q); float* d_g = sycl::malloc_device<float>(g.size(), q);
+    float* d_b = sycl::malloc_device<float>(b.size(), q); float* d_z = sycl::malloc_device<float>(z.size(), q);
+    float* d_gam = sycl::malloc_device<float>(S, q);
+    float* d_y[2] = {sycl::malloc_device<float>((size_t) MAXT * VD, q), sycl::malloc_device<float>((size_t) MAXT * VD, q)};
+    uint8_t* d_xq[2] = {sycl::malloc_device<uint8_t>((size_t) MAXT * VD / 32 * 36, q), sycl::malloc_device<uint8_t>((size_t) MAXT * VD / 32 * 36, q)};
+    q.memcpy(d_h, h.data(), h.size() * 4); q.memcpy(d_g, g.data(), g.size() * 4); q.memcpy(d_b, b.data(), b.size() * 4);
+    q.memcpy(d_z, z.data(), z.size() * 4); q.memcpy(d_gam, gam.data(), S * 4); q.wait();
+    const float eps = 1e-6f;
+    int bad = 0;
+    auto run_one = [&](int v, int T, int layer, bool slots, bool xq) {
+        k::gdn_grf_set_night(v);
+        float* st = d_st + st_floats * (size_t) (layer * NS);
+        if (slots) {
+            float* sts[2] = {st, st + st_floats};
+            const int r0[2] = {0, T / 2}, nr[2] = {T / 2, T - T / 2};
+            if (!k::night_gdn_step_norm_slots(sts, r0, nr, 2, d_h, C, d_g, d_b, d_z, d_gam, eps, d_y[v], hk, hv, &q)) std::printf("slots launch refused\n");
+        } else {
+            k::gdn_step_norm_multi(st, d_h, C, d_g, d_b, d_z, d_gam, eps, d_y[v], hk, hv, T, nullptr, &q, 0, xq ? d_xq[v] : nullptr);
+        }
+    };
+    for (int T : {2, 3, 4, 6, 8})
+        for (int mode = 0; mode < 3; ++mode) {
+            const bool slots = mode == 2, xq = mode == 1;
+            if (slots && T < 2) continue;
+            for (int v = 0; v < 2; ++v) { q.memset(d_y[v], 0xFF, (size_t) MAXT * VD * 4).wait(); q.memset(d_xq[v], 0x5A, (size_t) MAXT * VD / 32 * 36).wait(); run_one(v, T, 5, slots, xq); q.wait(); }
+            std::vector<float> y0((size_t) T * VD), y1((size_t) T * VD);
+            q.memcpy(y0.data(), d_y[0], y0.size() * 4).wait(); q.memcpy(y1.data(), d_y[1], y1.size() * 4).wait();
+            bool same = !std::memcmp(y0.data(), y1.data(), y0.size() * 4);
+            if (xq) {
+                std::vector<uint8_t> a((size_t) T * VD / 32 * 36), c(a.size());
+                q.memcpy(a.data(), d_xq[0], a.size()).wait(); q.memcpy(c.data(), d_xq[1], c.size()).wait();
+                same = same && !std::memcmp(a.data(), c.data(), a.size());
+            }
+            if (!same) { ++bad; std::printf("gdn step T=%d mode %d: DIFF\n", T, mode); }
+        }
+    k::gdn_grf_set_night(-1);
+    std::printf("gdn verify recurrence: 256-GRF vs default y (+q8_1 image) bitwise, T=2..8, per-slot / q8 / 2-slot: %s\n", bad ? "FAIL" : "equal");
+    for (int T : {3, 4, 6, 8})
+        for (int mode : {0, 2}) {
+            double t[2];
+            for (int v = 0; v < 2; ++v) {
+                t[v] = time_graph_us(q, [&] { for (int l = 0; l < NL; ++l) run_one(v, T, l, mode == 2, false); }, NL, reps);
+            }
+            k::gdn_grf_set_night(-1);
+            std::printf("gdn verify recurrence %s T=%d: default %.2f us, 256 GRF %.2f us per layer (%d layers' states in a graph)\n",
+                        mode == 2 ? "2 slots, one launch" : "1 slot", T, t[0], t[1], NL);
+        }
+    for (void* p : {(void*) d_st, (void*) d_h, (void*) d_g, (void*) d_b, (void*) d_z, (void*) d_gam, (void*) d_y[0], (void*) d_y[1], (void*) d_xq[0], (void*) d_xq[1]}) sycl::free(p, q);
+    return bad ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -477,6 +663,9 @@ int main(int argc, char** argv) {
     if (mode == "grouped") return grouped_bench(argc > 2 ? std::atoi(argv[2]) : 20);
     if (mode == "send") return send_bench(argc > 2 ? std::atoi(argv[2]) : 20);
     if (mode == "plan") return plan_bench(argc > 2 ? std::atoi(argv[2]) : 20);
+    if (mode == "router") return router_bench(argc > 2 ? std::atoi(argv[2]) : 20);
+    if (mode == "gdnab") return gdnab_bench(argc > 2 ? std::atoi(argv[2]) : 20);
+    if (mode == "gdnstep") return gdnstep_bench(argc > 2 ? std::atoi(argv[2]) : 20);
     std::fprintf(stderr, "usage: ep_night_bench grouped|send\n");
     return 2;
 }
