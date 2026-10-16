@@ -11,6 +11,7 @@
 #include "strata/sycl_queue.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/iq_dequant_expert.hpp"
+#include "strata/kernels/night_grouped.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "s26_tsum.dp.hpp"
@@ -6679,4 +6680,6 @@ bool xmx_gemm_iq(int ty, const void* gate, const void* up, int64_t K, int n_out,
     });
     return true;
 }
+// Night lab 2026-10-16: grouped prefill expert GEMM from the native blocks (STRATA_NIGHT_PREFILL_GROUPED)
+#include "night_grouped_expert.inc"
 }  // namespace strata::kernels

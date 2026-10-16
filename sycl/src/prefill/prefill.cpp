@@ -42,6 +42,7 @@
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/ep_mem.hpp"
 #include "strata/kernels/ep_kernels.hpp"
+#include "strata/kernels/night_grouped.hpp"
 #include "strata/prefill/kernels.hpp"
 
 #include <algorithm>
@@ -326,6 +327,22 @@ inline bool night_early() {
                                     "card 1 starts on a doorbell after the activation push; the shared expert runs after the host's routing wait");
     return v;
 }
+// STRATA_NIGHT_PREFILL_GROUPED=1 (expert parallel, card 1, implies STRATA_EP_PREFILL_GATHER_ALIAS's one gather): card 1's
+//   experts with <= STRATA_NIGHT_PREFILL_GROUPED_MAX rows (default 64) go first in its row order and run through
+//   night_grouped_f16 (IQ decode + joint_matrix in one launch per projection and row-tile size), a single SwiGLU per
+//   batch; the larger ones keep dequant + oneMKL.  FP32 accumulation order changes (rounding level).
+inline bool night_grouped() {
+    static const bool v = night_env("STRATA_NIGHT_PREFILL_GROUPED",
+                                    "card 1's small experts run through one grouped decode + XMX launch per projection");
+    return v;
+}
+inline int night_grouped_max() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_NIGHT_PREFILL_GROUPED_MAX");
+        return e ? std::max(1, std::min(1024, std::atoi(e))) : 64;
+    }();
+    return v;
+}
 inline bool night_f16sum() {
     static const bool v = night_env("STRATA_NIGHT_PREFILL_F16SUM",
                                     "the EP peer sums return as FP16 x per-token power-of-two scale (numerics change)");
@@ -583,6 +600,14 @@ struct PeerPrefill {
     uint32_t* push_done = nullptr;   // on the primary: ep_push_signal's group counter (zero between calls)
     bool early = false;
     bool f16sum = false;
+    // night lab GROUPED: the entry tables (gate/up then down) on card 1 and their host staging copy
+    strata::kernels::NightGroupedEntry* ng_ent = nullptr;
+    std::vector<strata::kernels::NightGroupedEntry> ng_host;
+    size_t ng_cap = 0;
+    int64_t ng_experts = 0, ng_launches = 0;
+    strata::kernels::NightGroupedEntry* ng0_ent = nullptr;   // on the primary: its own small experts' tables
+    std::vector<strata::kernels::NightGroupedEntry> ng0_host;
+    sycl::queue* ng0_q = nullptr;
     int32_t* reduce_slot = nullptr;
     float* reduce_weight = nullptr;
     std::vector<int32_t> reduce_slot_host;
@@ -666,6 +691,7 @@ struct PeerPrefill {
     std::vector<void*> owned;
     int64_t layers = 0, experts = 0, rows = 0, over_cap = 0;   // stats
     ~PeerPrefill() {
+        if (ng0_ent && ng0_q) sycl::free(ng0_ent, *ng0_q);   // night lab GROUPED: the primary's table, its own queue
         if (dev < 0) return;
         int prev = 0;
         prev = dpct::get_current_device_id();
@@ -1943,6 +1969,12 @@ bool Prefill::set_ep_peer(int device, core::ExpertCache* cache, std::string& err
         pp->early = ok;
     }
     if (ok && pp->reduce_rows && night_f16sum()) pp->f16sum = true;
+    if (ok && night_grouped()) {   // night lab GROUPED: the primary's own small experts (2 tables x 512 x 16 tiles)
+        pp->ng0_q = &dpct::get_in_order_queue();
+        pp->ng0_ent = sycl::malloc_device<strata::kernels::NightGroupedEntry>((size_t) 2 * 512 * 16, *pp->ng0_q);
+        ok = pp->ng0_ent != nullptr;
+        pp->ng0_host.reserve((size_t) 2 * 512 * 16);
+    }
     if (!ok) return false;
     const core::OnDevice on(device);
     ok = DPCT_CHECK_ERROR(pp->s = dpct::get_current_device().create_queue(true)) == 0 &&
@@ -1965,6 +1997,11 @@ bool Prefill::set_ep_peer(int device, core::ExpertCache* cache, std::string& err
     pp->dq_gu = (uint16_t*) take((size_t) 1280 * N * 2);
     pp->dq_d = (uint16_t*) take((size_t) N * 640 * 2);
     pp->src = (int32_t*) take((size_t) pp->cap_rows * 4);
+    if (night_grouped()) {   // night lab GROUPED: 2 tables x 512 experts x up to 16 row tiles each (1024-row cap)
+        pp->ng_cap = (size_t) 2 * 512 * 16;
+        pp->ng_ent = (strata::kernels::NightGroupedEntry*) take(pp->ng_cap * sizeof(strata::kernels::NightGroupedEntry));
+        pp->ng_host.reserve(pp->ng_cap);
+    }
     if (pp->reduce_rows) {
         pp->reduce_slot = (int32_t*) take((size_t) pp->cap_rows * 4);
         pp->reduce_weight = (float*) take((size_t) pp->cap_rows * 4);
@@ -2383,7 +2420,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
         // Both owner tables must cover the whole model with backed, live slots.
         static const bool peer_alias_opt = [] {
             const char* v = std::getenv("STRATA_EP_PREFILL_GATHER_ALIAS");
-            return v && v[0] == '1';
+            return (v && v[0] == '1') || night_grouped();   // night lab GROUPED reads the one-gather layout
         }();
         bool peer_alias_resident = false;
         if (peer_alias_opt && !m.borrowed && LB == 0 && LE == 48 && !next_ && !hand_in_ &&
@@ -3610,14 +3647,31 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             }
                             rows_local = T * K - rows_peer;
                         }
+                        // night lab GROUPED (card 0): its own experts with <= G rows first, when every one of them is resident and
+                        // the layer takes the plain FP16 path (no MMQ, no XMX modes, nothing streamed this layer)
+                        bool ng0 = night_grouped() && m.pp && m.pp->ipc() && m.pp->ng0_ent != nullptr && !use_mmq && lay.native &&
+                                   strata::prefill::xmx::mode() == 0 && m.Xs && m.Hh && m.cache && m.host_res &&
+                                   (!stream_all || seq_start[(size_t) l] == seq_start[(size_t) l + 1]);
+                        for (int32_t e = 0; ng0 && e < m.g->n_expert; ++e)
+                            if (m.cnt[(size_t) e] > 0 && m.cnt[(size_t) e] <= night_grouped_max() && (on_peer.empty() || !on_peer[(size_t) e]))
+                                ng0 = m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
                         {
                             int32_t r = 0;
-                            for (int32_t e = 0; e < m.g->n_expert; ++e)
-                                if (on_peer.empty() || !on_peer[(size_t) e]) { m.off[(size_t) e] = r; r += m.cnt[(size_t) e]; }
-                            // the peer's rows in order_peer's order (peer-held, then peer-streamed): its groups need them contiguous
-                            for (int kind = 1; kind <= 2 && !on_peer.empty(); ++kind)
+                            for (int pass = ng0 ? 0 : 1; pass <= 1; ++pass)
                                 for (int32_t e = 0; e < m.g->n_expert; ++e)
-                                    if (on_peer[(size_t) e] == kind) { m.off[(size_t) e] = r; r += m.cnt[(size_t) e]; }
+                                    if ((on_peer.empty() || !on_peer[(size_t) e]) &&
+                                        (!ng0 || (pass == 0) == (m.cnt[(size_t) e] <= night_grouped_max()))) {
+                                        m.off[(size_t) e] = r; r += m.cnt[(size_t) e];
+                                    }
+                            // the peer's rows in order_peer's order (peer-held, then peer-streamed): its groups need them contiguous
+                            // night lab GROUPED: card 1's held experts with <= G rows first (one contiguous block)
+                            const bool ng_order = !on_peer.empty() && m.pp && m.pp->ipc() && m.pp->ng_ent != nullptr;
+                            for (int pass = ng_order ? 0 : 1; pass <= 2 && !on_peer.empty(); ++pass)
+                                for (int32_t e = 0; e < m.g->n_expert; ++e)
+                                    if (on_peer[(size_t) e] == (pass == 0 ? 1 : pass) &&
+                                        (!ng_order || pass == 2 || (pass == 0) == (m.cnt[(size_t) e] <= night_grouped_max()))) {
+                                        m.off[(size_t) e] = r; r += m.cnt[(size_t) e];
+                                    }
                             m.off[(size_t) m.g->n_expert] = r;
                         }
                         std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
@@ -3632,6 +3686,12 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         for (int32_t e = 0; e < m.g->n_expert; ++e)
                             if (m.cnt[(size_t) e] > 0 && (on_peer.empty() || on_peer[(size_t) e] != 2))
                                 (!on_peer.empty() && on_peer[(size_t) e] ? order_peer : order).push_back(e);
+                        if (ng0)   // night lab GROUPED (card 0): as its offsets
+                            std::stable_partition(order.begin(), order.end(),
+                                                  [&](int32_t e) { return m.cnt[(size_t) e] <= night_grouped_max(); });
+                        if (!on_peer.empty() && m.pp && m.pp->ipc() && m.pp->ng_ent != nullptr)   // night lab GROUPED: as the offsets
+                            std::stable_partition(order_peer.begin(), order_peer.end(),
+                                                  [&](int32_t e) { return m.cnt[(size_t) e] <= night_grouped_max(); });
                         for (int32_t e = 0; e < m.g->n_expert && !on_peer.empty(); ++e)   // the peer-streamed ones last:
                             if (on_peer[(size_t) e] == 2) order_peer.push_back(e);        // their copies get the most time
                         // Aurora (STRATA_MMQ_RESIDENT_SORT_NE=1, opt-in): a layer whose experts are ALL resident and
@@ -3802,7 +3862,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                 int32_t alias_prev = -1;
                                 for (size_t j = 0; peer_alias && j < n; ++j) {
                                     const int32_t e = order_peer[j];
-                                    if (e <= alias_prev || e < 0 || e >= g.n_expert) { peer_alias = false; break; }
+                                    if ((P.ng_ent == nullptr && e <= alias_prev) || e < 0 || e >= g.n_expert) { peer_alias = false; break; }
                                     const int64_t ne = m.cnt[(size_t) e], o = m.off[(size_t) e] - rows_local;
                                     const int32_t slot = P.ep->slot_of(l, e);
                                     peer_alias = ne > 0 && ne <= T && o == alias_end && ne <= rows_peer - alias_end &&
@@ -3820,7 +3880,12 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                     gather_rows16(P.mixed_h, P.src, alias_x, rows_peer, N, ps);
                                     core::prefill_host::mark("peer_allgather_return");
                                 }
-                                for (size_t j = 0; j < n; ++j) {
+                                // night lab GROUPED: the leading run of order_peer with <= G rows goes through the grouped
+                                // kernels after the larger experts (processed first, from the highest offset, as before)
+                                size_t ng_n = 0;
+                                if (peer_alias && P.ng_ent != nullptr)
+                                    while (ng_n < n && m.cnt[(size_t) order_peer[ng_n]] <= night_grouped_max()) ++ng_n;
+                                for (size_t j = 0; j < n - ng_n; ++j) {
                                     const int32_t e = order_peer[peer_alias ? n - 1 - j : j];
                                     const int64_t o = m.off[(size_t) e] - rows_local, ne = m.cnt[(size_t) e];
                                     const uint8_t* bd = P.slot_ptr(l, e);
@@ -3835,6 +3900,72 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                     P.gemm->f16(expert_x, P.dq_gu, P.GUf, ne, 1280, N);
                                     swiglu_interleaved(P.GUf, P.Hh, ne, ps);
                                     P.gemm->f16(P.Hh, P.dq_d, rows + o * N, ne, N, 640);
+                                }
+                                if (ng_n > 0) {
+                                    // entries: each small expert cut into row tiles of 16 / 32 / 64 (by its count), grouped
+                                    // by tile size inside batches of <= T_max rows (GUf / Hh capacity); gate/up table then
+                                    // down table, uploaded in one copy
+                                    namespace sk = strata::kernels;
+                                    struct Batch { int64_t a, rows; size_t gu[4][2]; };
+                                    std::vector<Batch> batches;
+                                    P.ng_host.clear();
+                                    std::vector<sk::NightGroupedEntry> dn;
+                                    {
+                                        size_t j = 0;
+                                        while (j < ng_n) {
+                                            Batch b{};
+                                            b.a = m.off[(size_t) order_peer[j]] - rows_local;
+                                            size_t j1 = j;
+                                            int64_t br = 0;
+                                            while (j1 < ng_n && br + m.cnt[(size_t) order_peer[j1]] <= P.T_max) br += m.cnt[(size_t) order_peer[j1++]];
+                                            b.rows = br;
+                                            for (int t = 0; t < 4; ++t) {   // row tiles of 16 / 32 / 64 / 128
+                                                const int mt = 2 << t, cap = sk::night_grouped_rows(mt);
+                                                b.gu[t][0] = P.ng_host.size();
+                                                for (size_t i = j; i < j1; ++i) {
+                                                    const int32_t e = order_peer[i];
+                                                    const int c = m.cnt[(size_t) e];
+                                                    if ((c <= 16 ? 0 : c <= 32 ? 1 : c <= 64 ? 2 : 3) != t) continue;
+                                                    const int64_t o = m.off[(size_t) e] - rows_local - b.a;
+                                                    const uint8_t* bd = P.slot_ptr(l, e);
+                                                    for (int r0 = 0; r0 < c; r0 += cap) {
+                                                        P.ng_host.push_back({bd, o + r0, std::min(cap, c - r0), 0});
+                                                        dn.push_back({bd + f.down_off, o + r0, std::min(cap, c - r0), 0});
+                                                    }
+                                                }
+                                                b.gu[t][1] = P.ng_host.size();
+                                            }
+                                            batches.push_back(b);
+                                            j = j1;
+                                        }
+                                    }
+                                    const size_t ne_gu = P.ng_host.size();
+                                    if (2 * ne_gu > P.ng_cap) { err = "prefill (STRATA_NIGHT_PREFILL_GROUPED): too many entries"; return false; }
+                                    P.ng_host.insert(P.ng_host.end(), dn.begin(), dn.end());
+                                    ps->memcpy(P.ng_ent, P.ng_host.data(), P.ng_host.size() * sizeof(sk::NightGroupedEntry));
+                                    for (size_t bi = batches.size(); bi-- > 0;) {   // highest offsets first (alias in place)
+                                        const Batch& b = batches[bi];
+                                        for (int t = 0; t < 4; ++t) {
+                                            const int cnt_t = (int) (b.gu[t][1] - b.gu[t][0]);
+                                            if (cnt_t > 0 && !sk::night_grouped_f16(f.gu_type, true, P.ng_ent + b.gu[t][0], cnt_t, 2 << t,
+                                                                                     alias_x + b.a * N, P.GUf, 1280, (int) N, f.up_off, ps)) {
+                                                err = "prefill (STRATA_NIGHT_PREFILL_GROUPED): gate/up type " + std::to_string(f.gu_type);
+                                                return false;
+                                            }
+                                            P.ng_launches += cnt_t > 0;
+                                        }
+                                        swiglu_interleaved(P.GUf, P.Hh, b.rows, ps);
+                                        for (int t = 0; t < 4; ++t) {
+                                            const int cnt_t = (int) (b.gu[t][1] - b.gu[t][0]);
+                                            if (cnt_t > 0 && !sk::night_grouped_f16(f.d_type, false, P.ng_ent + ne_gu + b.gu[t][0], cnt_t, 2 << t,
+                                                                                     P.Hh, rows + b.a * N, (int) N, 640, 0, ps)) {
+                                                err = "prefill (STRATA_NIGHT_PREFILL_GROUPED): down type " + std::to_string(f.d_type);
+                                                return false;
+                                            }
+                                            P.ng_launches += cnt_t > 0;
+                                        }
+                                    }
+                                    P.ng_experts += (int64_t) ng_n;
                                 }
                                 strata::core::prefill_host::mark("peer_loop_end");
                                 if (P.reduce_rows && P.f16sum) {   // night lab F16SUM: FP16 rows, then T scales
@@ -4474,10 +4605,60 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                           std::exit(1);
                         }
                         };
+                        // night lab GROUPED (card 0): order's leading small experts in one grouped pass (rows [0, S) of Xs / GU / Hh / Dm)
+                        size_t ng0_n = 0;
+                        if (ng0) {
+                            namespace sk = strata::kernels;
+                            while (ng0_n < order.size() && m.cnt[(size_t) order[ng0_n]] <= night_grouped_max()) ++ng0_n;
+                            if (ng0_n > 0) {
+                                const auto& f = lay.fmt[(size_t) l];
+                                PeerPrefill& P0 = *m.pp;
+                                P0.ng0_host.clear();
+                                std::vector<sk::NightGroupedEntry> dn;
+                                size_t lim[5] = {0, 0, 0, 0, 0};
+                                int64_t S = 0;
+                                for (int t = 0; t < 4; ++t) {
+                                    const int cap = sk::night_grouped_rows(2 << t);
+                                    for (size_t i = 0; i < ng0_n; ++i) {
+                                        const int32_t e = order[i];
+                                        const int c = m.cnt[(size_t) e];
+                                        if (t == 0) S += c;
+                                        if ((c <= 16 ? 0 : c <= 32 ? 1 : c <= 64 ? 2 : 3) != t) continue;
+                                        const uint8_t* bd = m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]);
+                                        for (int r0 = 0; r0 < c; r0 += cap) {
+                                            P0.ng0_host.push_back({bd, (int64_t) m.off[(size_t) e] + r0, std::min(cap, c - r0), 0});
+                                            dn.push_back({bd + f.down_off, (int64_t) m.off[(size_t) e] + r0, std::min(cap, c - r0), 0});
+                                        }
+                                    }
+                                    lim[t + 1] = P0.ng0_host.size();
+                                }
+                                const size_t ne_gu = P0.ng0_host.size();
+                                P0.ng0_host.insert(P0.ng0_host.end(), dn.begin(), dn.end());
+                                m.cs->memcpy(P0.ng0_ent, P0.ng0_host.data(), P0.ng0_host.size() * sizeof(sk::NightGroupedEntry));
+                                pt.mark(kPfGemmGU, cs);
+                                for (int t = 0; t < 4; ++t)
+                                    if (lim[t + 1] > lim[t] &&
+                                        !sk::night_grouped_f16(f.gu_type, true, P0.ng0_ent + lim[t], (int) (lim[t + 1] - lim[t]), 2 << t,
+                                                               m.Xs, m.GU, 1280, (int) N, f.up_off, m.cs)) {
+                                        err = "prefill (STRATA_NIGHT_PREFILL_GROUPED): card 0 gate/up type " + std::to_string(f.gu_type);
+                                        return false;
+                                    }
+                                swiglu_interleaved(m.GU, m.Hh, S, m.cs);
+                                pt.mark(kPfGemmD, cs);
+                                for (int t = 0; t < 4; ++t)
+                                    if (lim[t + 1] > lim[t] &&
+                                        !sk::night_grouped_f16(f.d_type, false, P0.ng0_ent + ne_gu + lim[t], (int) (lim[t + 1] - lim[t]), 2 << t,
+                                                               m.Hh, m.Dm, (int) N, 640, 0, m.cs)) {
+                                        err = "prefill (STRATA_NIGHT_PREFILL_GROUPED): card 0 down type " + std::to_string(f.d_type);
+                                        return false;
+                                    }
+                                stats_.experts_resident += (int64_t) ng0_n;
+                            }
+                        }
                         if (!stream_all) {
-                            size_t staged = 0;
+                            size_t staged = ng0_n;
                             const size_t lookahead = STAGE - 1;
-                            for (size_t j = 0; j < order.size(); ++j) {
+                            for (size_t j = ng0_n; j < order.size(); ++j) {
                                 while (staged < order.size() && staged <= j + lookahead) {
                                     if (!stage_one(staged)) return false;
                                     ++staged;
@@ -4518,7 +4699,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                               std::exit(1);
                             }
                             };
-                            for (size_t j = 0; j < order.size(); ++j) {
+                            for (size_t j = ng0_n; j < order.size(); ++j) {
                                 const int32_t e = order[j];
                                 release_to(e);
                                 if (k < kend && seq[k].e == e) {

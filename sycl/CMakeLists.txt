@@ -403,6 +403,8 @@ if(STRATA_SYCL_PARITY)
   target_link_libraries(night_ep_expert_bench PRIVATE strata_kernels strata_prefill)
   add_executable(night_ep_sum_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/night_ep_sum_bench.cpp)   # night lab: F16 EP sums + doorbell
   target_link_libraries(night_ep_sum_bench PRIVATE strata_kernels)
+  add_executable(night_grouped_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/night_grouped_bench.cpp)   # night lab: grouped expert GEMM
+  target_link_libraries(night_grouped_bench PRIVATE strata_kernels strata_prefill)
   # one native expert three ways on real GGUF rows (ggml reference, CPU path, GPU native_expert_grouped):
   #   native_expert_parity <shard1.gguf> [layer ...]
   if(STRATA_NATIVE_EXPERTS)
