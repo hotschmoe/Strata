@@ -74,6 +74,26 @@ constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
+// night lab: STRATA_NIGHT_EP_PSUM=1 - the EP peer returns one weighted row per token (ep_send_psum / ep_combine_psum)
+inline bool g_night_ep_psum() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_NIGHT_EP_PSUM");
+        const bool b = v != nullptr && v[0] == '1';
+        if (b) std::fprintf(stderr, "strata night: STRATA_NIGHT_EP_PSUM=1 (EP peer returns per-token weighted sums)\n");
+        return b;
+    }();
+    return on;
+}
+// night lab: STRATA_NIGHT_EP_PLAN1=1 - card 0 plans card 1's entries too and pushes the plan with the rows
+inline bool g_night_ep_plan1() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_NIGHT_EP_PLAN1");
+        const bool b = v != nullptr && v[0] == '1';
+        if (b) std::fprintf(stderr, "strata night: STRATA_NIGHT_EP_PLAN1=1 (card 0 makes and pushes card 1's expert plan)\n");
+        return b;
+    }();
+    return on;
+}
 inline bool g_lfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE"); return v != nullptr && v[0] == '1'; }(); return on; }
 inline bool g_lfuse_gate() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE_GATE"); return v == nullptr || v[0] != '0'; }(); return on; }
 inline bool g_lfuse_pair() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE_PAIR"); return v == nullptr || v[0] != '0'; }(); return on; }
@@ -1356,6 +1376,14 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
         static const bool ep_self = [] { const char* v = std::getenv("STRATA_EP_SELF"); return v && v[0] == '1'; }();
+        if (ar_on() && ep_on() && !ep_self && !ep_verify_ && ep_plan1_on_) {   // night lab: both cards' plans here
+            resident_plan_ep_pair(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert,
+                                  ep_cfg_.res1_on0 + l * g.n_expert, (int) g.n_expert, hits_.cache_base, slot_off_d_,
+                                  (long long) hits_.blob, plan_ + (size_t) grp * (size_t) (plan_i32_ + 16),
+                                  ep_cfg_.cache_base1, ep_cfg_.slot_off1_on0, (long long) ep_cfg_.blob1,
+                                  ep_plan1_on0_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, cs,
+                                  m_plan_err_);
+        } else
         if (ar_on() && ep_on() && !ep_self && !ep_verify_) {   // expert parallelism: this card's entries only, the peer's are its own plan
             resident_plan_ep(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert,
                              ep_cfg_.res1_on0 + l * g.n_expert, 1, (int) g.n_expert, hits_.cache_base, slot_off_d_,
@@ -1447,12 +1475,22 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             const size_t xq_bytes = (size_t) n * (N / 32) * 36;
             uint8_t* slot0 = ep_inbox_on0_ + (size_t) grp * ep_slot_bytes_;
             uint8_t* slot1 = ep_in1_ + (size_t) grp * ep_slot_bytes_;   // the inbox slot, copied past the caches
+            if (ep_psum_ || ep_plan1_on_)   // night lab: the routing weights / card 1's plan ride along
+                ep_push_w(ids_ + tb * K, ep_psum_ ? w_ + tb * K : nullptr, n * (int) K,
+                          nat_xq_ + (size_t) tb * (N / 32) * 36, xq_bytes, (int32_t*) slot0,
+                          ep_psum_ ? (float*) (slot0 + ep_w_off_) : nullptr, slot0 + ep_xq_off_,
+                          ep_inflag_on0_ + (size_t) ring * 16, ep_ctr0_, cs,
+                          ep_plan1_on_ ? ep_plan1_on0_ + (size_t) grp * (size_t) (plan_i32_ + 16) : nullptr,
+                          ep_plan_words_, ep_plan1_on_ ? (int32_t*) (slot0 + ep_plan_off_) : nullptr);
+            else
             ep_push(ids_ + tb * K, n * (int) K, nat_xq_ + (size_t) tb * (N / 32) * 36, xq_bytes, (int32_t*) slot0,
                     slot0 + ep_xq_off_, ep_inflag_on0_ + (size_t) ring * 16, ep_ctr0_, cs);
             ep_wait(ep_inflag1_ + (size_t) ring * 16, ep_ctr1_, ep_spin_, ep_err1_, ring, ep_q_);
             ep_copy_uncached(slot1, ep_inbox1_ + (size_t) grp * ep_slot_bytes_, ep_xq_off_ + xq_bytes, ep_q_);
             const int64_t capx = (int64_t) max_t_ * K, cap = (int64_t) n * K;
             int32_t* pl1 = ep_plan1_ + (size_t) grp * (size_t) (plan_i32_ + 16);
+            if (ep_plan1_on_) pl1 = (int32_t*) (slot1 + ep_plan_off_);   // night lab: card 0's plan, in the inbox copy
+            else
             resident_plan_ep((const int32_t*) slot1, (int) cap, (int) K, ep_cfg_.res0_on1 + l * g.n_expert,
                              ep_cfg_.res1 + l * g.n_expert, 2, (int) g.n_expert, ep_cfg_.cache_base1, ep_cfg_.slot_off1,
                              (long long) ep_cfg_.blob1, pl1, (long long) capx, ep_q_, ep_plan_err1_);
@@ -1462,6 +1500,11 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             native_expert_grouped(L, (const unsigned long long*) (pl1 + ptr_off), pl1 + 4, pl1, pl1 + 4 + capx + 1,
                                   pl1 + 4 + capx + 1 + capx, cap, cap, slot1 + ep_xq_off_, ep_scratch1_,
                                   ep_rows1_ + (size_t) tb * K * N, ep_q_, 0);
+            if (ep_psum_)   // night lab: one weighted-sum row per token back to card 0
+                ep_send_psum(ep_psum_on1_ + (size_t) tb * N, ep_rows1_ + (size_t) tb * K * N, (const int32_t*) slot1,
+                             (const float*) (slot1 + ep_w_off_), ep_cfg_.res0_on1 + l * g.n_expert, n, (int) K, N,
+                             ep_done1_, ep_ret_on1_ + (size_t) ring * 16, ep_ctr1_, ep_q_);
+            else
             ep_send_rows(ep_parts_on1_ + (size_t) tb * K * N, ep_rows1_ + (size_t) tb * K * N, (const int32_t*) slot1,
                          ep_cfg_.res0_on1 + l * g.n_expert, (int) cap, N, ep_done1_, ep_ret_on1_ + (size_t) ring * 16,
                          ep_ctr1_, ep_q_);
@@ -1586,6 +1629,13 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             ev_join_ != nullptr) {
             cs->ext_oneapi_submit_barrier({*ev_join_});
         }
+        if (ar_on() && ep_on() && ep_psum_) {   // night lab STRATA_NIGHT_EP_PSUM: own rows + the peer's per-token sums
+            try {
+                ep_combine_psum(parts_ + (size_t) tb * K * N, w_ + tb * K, ids_ + tb * K, hits_.d_res + l * g.n_expert,
+                                ep_psum0_ + (size_t) tb * N, shared_ + tb * N, sg_gated_[grp] ? sh_g_ + tb : nullptr,
+                                bo_ + tb * N, N, (int) K, n, cs);
+            } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
+        } else
         if (sg_gated_[grp]) {   // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it (all rows are hits)
             try {
                 native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
@@ -1836,6 +1886,21 @@ bool Verifier::ep_init(std::string& err) {
     if (const char* v = std::getenv("STRATA_EP_SPIN_MAX")) ep_spin_ = (uint32_t) std::strtoul(v, nullptr, 10);
     auto align = [](size_t b) { return (b + 255) / 256 * 256; };
     ep_xq_off_ = align((size_t) MT * K * 4);
+    {   // night lab STRATA_NIGHT_EP_PSUM: the weights between the ids and the q8_1 rows (one copy covers all three)
+        static const bool self_env = [] { const char* v = std::getenv("STRATA_EP_SELF"); return v && v[0] == '1'; }();
+        ep_psum_ = g_night_ep_psum() && !ep_verify_ && !self_env && K == 10 && N % 4 == 0;
+        if (ep_psum_) { ep_w_off_ = ep_xq_off_; ep_xq_off_ += align((size_t) MT * K * 4); }
+        // STRATA_NIGHT_EP_PLAN1: card 1's plan (the words native_expert_grouped reads) before the q8_1 rows
+        ep_plan1_on_ = g_night_ep_plan1() && !ep_verify_ && !self_env &&
+                       (ep_cfg_.slot_off1 == nullptr || ep_cfg_.slot_off1_on0 != nullptr);
+        if (ep_plan1_on_) {
+            const int64_t capx = MT * K;
+            const int64_t ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+            ep_plan_words_ = (int) (ptr_off + 2 * capx);
+            ep_plan_off_ = ep_xq_off_;
+            ep_xq_off_ += align((size_t) ep_plan_words_ * 4);
+        }
+    }
     ep_slot_bytes_ = ep_xq_off_ + align((size_t) MT * (N / 32) * 36);
     const size_t flag_bytes = (size_t) (g.n_layers * 2 + 2) * 64;   // a 64-byte line per ring (G <= 2)
     auto* inbox = new EpRegion, *inflag = new EpRegion, *parts = new EpRegion, *ret = new EpRegion;
@@ -1843,6 +1908,12 @@ bool Verifier::ep_init(std::string& err) {
     if (!ep_region_alloc(d1, d0, 2 * ep_slot_bytes_, *inbox, err) || !ep_region_alloc(d1, d0, flag_bytes, *inflag, err) ||
         !ep_region_alloc(d0, d1, (size_t) MT * K * N * 4, *parts, err) || !ep_region_alloc(d0, d1, flag_bytes, *ret, err))
         return false;
+    if (ep_psum_) {
+        auto* ps = new EpRegion;
+        ep_psum_reg_ = ps;
+        if (!ep_region_alloc(d0, d1, (size_t) MT * N * 4, *ps, err)) return false;
+        ep_psum0_ = (float*) ps->local; ep_psum_on1_ = (float*) ps->remote;
+    }
     ep_inbox1_ = (uint8_t*) inbox->local;   ep_inbox_on0_ = (uint8_t*) inbox->remote;
     ep_inflag1_ = (uint32_t*) inflag->local; ep_inflag_on0_ = (uint32_t*) inflag->remote;
     ep_ret0_ = (uint32_t*) ret->local;       ep_ret_on1_ = (uint32_t*) ret->remote;
@@ -1850,6 +1921,10 @@ bool Verifier::ep_init(std::string& err) {
     // the peer writes its rows straight into parts_; the two checks keep this card's own rows apart from them
     static const bool self = [] { const char* v = std::getenv("STRATA_EP_SELF"); return v && v[0] == '1'; }();
     if (!ep_verify_ && !self) parts_ = ep_rows0_;
+    if (ep_plan1_on_) {
+        ep_plan1_on0_ = sycl::malloc_device<int32_t>((size_t) 2 * (plan_i32_ + 16), *cs_);
+        if (ep_plan1_on0_ == nullptr) { err = "verify: expert parallel: plan buffer failed"; return false; }
+    }
     ep_ctr0_ = sycl::malloc_device<uint32_t>(16, *cs_);
     cs_->memset(ep_ctr0_, 0, 64).wait();
     ep_err0_ = (uint32_t*) strata::host_malloc_polled(64, *cs_);
@@ -1886,7 +1961,7 @@ void Verifier::ep_free() {
         for (auto& x : ep_exec_) { delete x; x = nullptr; }
         for (auto& kv : ep_exec_bm_) delete kv.second;
         ep_exec_bm_.clear();
-        for (void** r : {&ep_inbox_, &ep_inflag_, &ep_parts_, &ep_ret_})
+        for (void** r : {&ep_inbox_, &ep_inflag_, &ep_parts_, &ep_ret_, &ep_psum_reg_})
             if (*r != nullptr) { ep_region_free(*(EpRegion*) *r); delete (EpRegion*) *r; *r = nullptr; }
         if (ep_q_ != nullptr) {
             for (void* p : {(void*) ep_ctr1_, (void*) ep_plan1_, (void*) ep_in1_, (void*) ep_rows1_, (void*) ep_done1_,
@@ -1895,6 +1970,7 @@ void Verifier::ep_free() {
             for (uint32_t* p : {ep_err1_, ep_plan_err1_}) if (p) strata::host_free_polled(p, *ep_q_);
         }
         if (ep_ctr0_ != nullptr) sycl::free(ep_ctr0_, *cs_);
+        if (ep_plan1_on0_ != nullptr) { sycl::free(ep_plan1_on0_, *cs_); ep_plan1_on0_ = nullptr; }
         if (ep_err0_ != nullptr) strata::host_free_polled(ep_err0_, *cs_);
     } catch (...) {}   // at process exit the context can already be gone (see ~Verifier)
     ep_q_ = nullptr; ep_ctr0_ = ep_ctr1_ = nullptr; ep_plan1_ = nullptr; ep_in1_ = nullptr; ep_rows1_ = nullptr; ep_done1_ = nullptr; ep_scratch1_ = nullptr;

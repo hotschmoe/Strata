@@ -1,6 +1,7 @@
 // src/kernels/cuda/ep_kernels.dp.cpp (SYCL port only) - see include/strata/kernels/ep_kernels.hpp.
 #include <sycl/sycl.hpp>
 #include <algorithm>
+#include <stdexcept>
 #include "strata/sycl_queue.hpp"
 #include "strata/sycl_doorbell.hpp"
 #include "strata/kernels/ep_kernels.hpp"
@@ -142,6 +143,130 @@ void ep_send_rows(float* peer_rows, const float* rows, const int32_t* ids, const
     });
 }
 
+
+// ---- night lab STRATA_NIGHT_EP_PSUM ----
+#ifndef STRATA_NIGHT_PSUM_UNCACHED
+#define STRATA_NIGHT_PSUM_UNCACHED 0
+#endif
+// ----------------------------------------------------------------------------------
+void ep_push_w(const int32_t* ids, const float* w, int n_ids, const uint8_t* xq, size_t xq_bytes, int32_t* peer_ids,
+               float* peer_w, uint8_t* peer_xq, uint32_t* peer_flag, const uint32_t* ctr, void* stream,
+               const int32_t* plan, int plan_words, int32_t* peer_plan) {
+    constexpr size_t WG = 256;
+    const size_t words = xq_bytes / 4;
+    q_of(stream)->parallel_for<class ep_push_w_kernel>(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
+        const size_t lid = it.get_local_id(0);
+        for (size_t i = lid; i < (size_t) n_ids; i += WG) {
+            peer_ids[i] = ids[i];
+            if (w != nullptr) peer_w[i] = w[i];
+        }
+        if (plan != nullptr)
+            for (size_t i = lid; i < (size_t) plan_words; i += WG) peer_plan[i] = plan[i];
+        const uint32_t* s = (const uint32_t*) xq;
+        uint32_t* d = (uint32_t*) peer_xq;
+        for (size_t i = lid; i < words; i += WG) d[i] = s[i];
+        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+        sycl::group_barrier(it.get_group(), sycl::memory_scope::system);
+        if (lid == 0) sys_store(peer_flag, *ctr);
+    });
+}
+
+void ep_send_psum(float* peer_sum, const float* rows, const int32_t* ids, const float* w, const int32_t* res0,
+                  int n_tok, int k, int64_t row, uint32_t* done, uint32_t* peer_flag, const uint32_t* ctr, void* stream) {
+    if (n_tok <= 0) return;
+    constexpr size_t WG = 64;                       // 64 float4 = 256 columns per work-group
+    const int64_t n4 = row / 4;
+    const int chunks = (int) ((n4 + WG - 1) / WG);
+    const uint32_t total = (uint32_t) (n_tok * chunks);
+    using sys_rmw = sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::system>;
+    q_of(stream)->parallel_for<class ep_send_psum_kernel>(
+        sycl::nd_range<1>((size_t) total * WG, WG), [=](sycl::nd_item<1> it) {
+            const int g = (int) it.get_group(0);
+            const int t = g / chunks;
+            const int64_t c4 = (int64_t) (g % chunks) * WG + (int64_t) it.get_local_id(0);
+            if (c4 < n4) {
+                sycl::float4 acc(0.0f);
+                for (int j = 0; j < k; ++j) {
+                    const int32_t e = ids[t * k + j];
+                    if (e >= 0 && res0[e] >= 0) continue;   // card 0's entry
+                    const sycl::float4 v = reinterpret_cast<const sycl::float4*>(rows + (size_t) (t * k + j) * row)[c4];
+                    acc = sycl::fma(v, sycl::float4(w[t * k + j]), acc);   // fma(v, w, 0) = the rounded product
+                }
+                reinterpret_cast<sycl::float4*>(peer_sum + (size_t) t * row)[c4] = acc;
+            }
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            sycl::group_barrier(it.get_group());
+            if (it.get_local_id(0) == 0 && sys_rmw(*done).fetch_add(1u) == total - 1) {
+                *done = 0;
+                sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+                sys_store(peer_flag, *ctr);
+            }
+        });
+}
+
+template <int KK, bool GATED> class ep_combine_psum_kernel;
+template <int KK, bool GATED>
+static void combine_psum_impl(const float* parts, const float* w, const int32_t* ids, const int32_t* res0,
+                              const float* psum, const float* shared, const float* sg, float* out, int64_t row,
+                              int n_tok, void* stream) {
+    constexpr size_t WG = 128;
+    const int64_t n4 = row / 4;
+    const size_t gx = (size_t) ((n4 + WG - 1) / WG);
+    q_of(stream)->parallel_for<ep_combine_psum_kernel<KK, GATED>>(
+        sycl::nd_range<2>(sycl::range<2>((size_t) n_tok, gx * WG), sycl::range<2>(1, WG)), [=](sycl::nd_item<2> it) {
+            const int t = (int) it.get_global_id(0);
+            const int64_t c4 = (int64_t) it.get_global_id(1);
+            if (c4 >= n4) return;
+            // every load first (they are independent): the peer's sum (past the caches), the shared row, ids, weights,
+            // all KK part rows (parts_ holds KK rows per token; the peer's are stale and only selected away)
+#if STRATA_NIGHT_PSUM_UNCACHED
+            const uint64_t* pw = reinterpret_cast<const uint64_t*>(psum + (size_t) t * row) + 2 * c4;
+            const auto lo = sycl::bit_cast<sycl::float2>(sys_load_mapped(pw));
+            const auto hi = sycl::bit_cast<sycl::float2>(sys_load_mapped(pw + 1));
+#else   // plain loads, as native_moe_combine_multi reads the peer's rows in parts_ (same region kind, same flag protocol)
+            const sycl::float4 pv = reinterpret_cast<const sycl::float4*>(psum + (size_t) t * row)[c4];
+            const sycl::float2 lo(pv.x(), pv.y()), hi(pv.z(), pv.w());
+#endif
+            const sycl::float4 sh = reinterpret_cast<const sycl::float4*>(shared + (size_t) t * row)[c4];
+            int32_t e[KK];
+            float wv[KK];
+            sycl::float4 p[KK];
+#pragma unroll
+            for (int j = 0; j < KK; ++j) {
+                e[j] = ids[t * KK + j];
+                wv[j] = w[t * KK + j];
+                p[j] = reinterpret_cast<const sycl::float4*>(parts + (size_t) (t * KK + j) * row)[c4];
+            }
+            bool own[KK];
+#pragma unroll
+            for (int j = 0; j < KK; ++j) own[j] = e[j] >= 0 && res0[e[j]] >= 0;
+            sycl::float4 sum(0.0f);
+            bool first = true;
+#pragma unroll
+            for (int j = 0; j < KK; ++j) {
+                if (!own[j]) continue;   // the peer's entry: it is in psum
+                if (first) { sum = p[j] * sycl::float4(wv[j]); first = false; }
+                else sum = sycl::fma(p[j], sycl::float4(wv[j]), sum);
+            }
+            sum += sycl::float4(lo.x(), lo.y(), hi.x(), hi.y());
+            if constexpr (GATED) {
+#pragma clang fp contract(off)
+                const float gg = 1.0f / (1.0f + sycl::native::exp(-sg[t]));
+                const sycl::float4 shg = sh * sycl::float4(gg);
+                sum += shg;
+            } else {
+                sum += sh;
+            }
+            reinterpret_cast<sycl::float4*>(out + (size_t) t * row)[c4] = sum;
+        });
+}
+void ep_combine_psum(const float* parts, const float* w, const int32_t* ids, const int32_t* res0, const float* psum,
+                     const float* shared, const float* sg, float* out, int64_t row, int k, int n_tok, void* stream) {
+    if (n_tok <= 0) return;
+    if (k != 10 || (row & 3) != 0) throw std::invalid_argument("ep_combine_psum: k must be 10 and row a multiple of 4");
+    if (sg != nullptr) combine_psum_impl<10, true>(parts, w, ids, res0, psum, shared, sg, out, row, n_tok, stream);
+    else combine_psum_impl<10, false>(parts, w, ids, res0, psum, shared, sg, out, row, n_tok, stream);
+}
 
 void ep_compare(const float* parts, const float* peer_rows, const int32_t* ids, const int32_t* res0, int n, int64_t row,
                 uint32_t* mismatch, void* stream) {

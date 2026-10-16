@@ -6186,6 +6186,11 @@ int main(int argc, char **argv) try {
         ep_cfg.res0_on1 = res0_on1;
         ep_cfg.cache_base1 = ep_cache->device_slot(0);
         ep_cfg.slot_off1 = off1;
+        if (off1 != nullptr && std::getenv("STRATA_NIGHT_EP_PLAN1") && std::getenv("STRATA_NIGHT_EP_PLAN1")[0] == '1') {
+            auto* off1_on0 = sycl::malloc_device<unsigned long long>((size_t) ep_cache->slots(), dpct::get_in_order_queue());
+            dpct::get_in_order_queue().memcpy(off1_on0, ep_cache->slot_offsets(), (size_t) ep_cache->slots() * 8).wait();
+            ep_cfg.slot_off1_on0 = off1_on0;
+        }
         ep_cfg.blob1 = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
     }
     if (!o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr &&

@@ -2253,6 +2253,157 @@ __dpct_inline__ void native_down_kernel(
     }
 }
 
+// ---- night lab STRATA_NIGHT_EP_ROWS=2 (default off): each lane computes RPL rows of the expert for the same lane
+// parts, so a part's activation words (8 x 4-byte loads + the scale per entry: most of the loads of a small-window
+// dot) are read once per RPL rows instead of once per row.  Each (row, entry) keeps row_dot_multi_iq's k order,
+// Multi<TY>::finish and lanes_sum<LN>, so the outputs are bitwise the per-row kernels' (for the formats whose single
+// entry dot is bitwise the Multi one: checked by ep_night_bench grouped).
+template <int TY, int LANES, int R, int E>
+__dpct_inline__ void rows_dot_multi_iq(const uint8_t* const* rows, const block_q8_1* const* xs, int nb, int sub,
+                                       float (&out)[R][E]) {
+    using F = Fmt<TY>;
+    using M = Multi<TY>;
+    float s[R][E];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int e = 0; e < E; ++e) s[r][e] = 0.f;
+    for (int k = sub; k < nb * F::ipb; k += LANES) {
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        int u[E][8];
+        float ds[E];
+#pragma unroll
+        for (int e = 0; e < E; ++e) M::acts(xs[e] + kbx * (F::qk / 32), iqs, u[e], ds[e]);
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            MultiW m;
+            M::prep(rows[r], kbx, iqs, m, nullptr);
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                int s0 = 0, s1 = 0;
+#pragma unroll
+                for (int j = 0; j < M::NW / 2; ++j) s0 = ggml_cuda_dp4a(m.w[j], u[e][j], s0);
+#pragma unroll
+                for (int j = M::NW / 2; j < M::NW; ++j) s1 = ggml_cuda_dp4a(m.w[j], u[e][j], s1);
+                s[r][e] += M::finish(s0, s1, m, ds[e]);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int e = 0; e < E; ++e) out[r][e] = lanes_sum<LANES>(s[r][e]);
+}
+
+// gate/up: virtual rows v = row0 + rib + i * (256 / LN), i < RPL (gate rows, then up rows)
+template <int TG, int LN, int RPL>
+__dpct_inline__ void native_gu_kernel_rows(
+    const unsigned long long *__restrict__ grp_ptr,
+    const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
+    const int32_t *__restrict__ ent_tok, const block_q8_1 *__restrict__ xq,
+    NativeExpertLayout L, float *__restrict__ gate, float *__restrict__ up) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int ng = *n_groups;
+    if ((int) item_ct1.get_group(1) >= ng) return;
+    constexpr int RB = 256 / LN;
+    const int lid = (int) item_ct1.get_local_id(2);
+    const int rib = lid / LN, sub = lid % LN;
+    const int row0 = (int) item_ct1.get_group(2) * RB * RPL + rib;
+    const int nrows = (int) (2 * L.n_ff);
+    if (row0 >= nrows) return;   // no barrier below
+    const int nb = (int) (L.n_embd / Fmt<TG>::qk), xb = (int) (L.n_embd / 32);
+    size_t off[RPL];
+    float* dst[RPL];
+    bool live[RPL];
+#pragma unroll
+    for (int i = 0; i < RPL; ++i) {
+        const int v = row0 + i * RB;
+        live[i] = v < nrows;
+        const int vv = live[i] ? v : row0;   // a dead row repeats row0 (computed, not stored)
+        const bool is_up = vv >= L.n_ff;
+        const int r = is_up ? vv - (int) L.n_ff : vv;
+        off[i] = (is_up ? L.up_off : 0) + (size_t) r * L.gu_row;
+        dst[i] = (is_up ? up : gate) + r;
+    }
+    for (int g = (int) item_ct1.get_group(1); g < ng; g += (int) item_ct1.get_group_range(1)) {
+        const uint8_t* base = (const uint8_t*) grp_ptr[g];
+        const uint8_t* rows[RPL];
+#pragma unroll
+        for (int i = 0; i < RPL; ++i) rows[i] = base + off[i];
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        int e = e0;
+        auto pass = [&](auto ec) {
+            constexpr int EC = decltype(ec)::value;
+            const block_q8_1* xs[EC];
+#pragma unroll
+            for (int j = 0; j < EC; ++j) xs[j] = xq + (size_t) ent_tok[e + j] * xb;
+            float o[RPL][EC];
+            rows_dot_multi_iq<TG, LN, RPL, EC>(rows, xs, nb, sub, o);
+            if (sub == 0)
+#pragma unroll
+                for (int i = 0; i < RPL; ++i)
+                    if (live[i])
+#pragma unroll
+                        for (int j = 0; j < EC; ++j) dst[i][(size_t) (e + j) * L.n_ff] = o[i][j];
+            e += EC;
+        };
+        for (; e + 4 <= e1;) pass(std::integral_constant<int, 4>{});
+        if (e + 2 <= e1) pass(std::integral_constant<int, 2>{});
+        if (e < e1) pass(std::integral_constant<int, 1>{});
+    }
+}
+
+template <int TD, int LN, int RPL>
+__dpct_inline__ void native_down_kernel_rows(
+    const unsigned long long *__restrict__ grp_ptr,
+    const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
+    const int32_t *__restrict__ ent_dst, const block_q8_1 *__restrict__ hq,
+    NativeExpertLayout L, float *__restrict__ out) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int ng = *n_groups;
+    if ((int) item_ct1.get_group(1) >= ng) return;
+    constexpr int RB = 256 / LN;
+    const int lid = (int) item_ct1.get_local_id(2);
+    const int rib = lid / LN, sub = lid % LN;
+    const int r0 = (int) item_ct1.get_group(2) * RB * RPL + rib;
+    if (r0 >= L.n_embd) return;
+    const int nb = (int) (L.n_ff / Fmt<TD>::qk), hb = (int) (L.n_ff / 32);
+    int rr[RPL];
+    bool live[RPL];
+#pragma unroll
+    for (int i = 0; i < RPL; ++i) {
+        const int r = r0 + i * RB;
+        live[i] = r < L.n_embd;
+        rr[i] = live[i] ? r : r0;
+    }
+    for (int g = (int) item_ct1.get_group(1); g < ng; g += (int) item_ct1.get_group_range(1)) {
+        const uint8_t* base = (const uint8_t*) grp_ptr[g] + L.down_off;
+        const uint8_t* rows[RPL];
+#pragma unroll
+        for (int i = 0; i < RPL; ++i) rows[i] = base + (size_t) rr[i] * L.d_row;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        int e = e0;
+        auto pass = [&](auto ec) {
+            constexpr int EC = decltype(ec)::value;
+            const block_q8_1* xs[EC];
+#pragma unroll
+            for (int j = 0; j < EC; ++j) xs[j] = hq + (size_t) (e + j) * hb;
+            float o[RPL][EC];
+            rows_dot_multi_iq<TD, LN, RPL, EC>(rows, xs, nb, sub, o);
+            if (sub == 0)
+#pragma unroll
+                for (int i = 0; i < RPL; ++i)
+                    if (live[i])
+#pragma unroll
+                        for (int j = 0; j < EC; ++j) out[(size_t) ent_dst[e + j] * L.n_embd + rr[i]] = o[i][j];
+            e += EC;
+        };
+        for (; e + 4 <= e1;) pass(std::integral_constant<int, 4>{});
+        if (e + 2 <= e1) pass(std::integral_constant<int, 2>{});
+        if (e < e1) pass(std::integral_constant<int, 1>{});
+    }
+}
+
 // native_down_kernel with the entries taken GRP_NC at a time
 template <int TD, bool SUB_DOWN = true>
 /*
@@ -4355,10 +4506,74 @@ inline int down_lanes() { static const int v = lanes_env("STRATA_DOWN_LANES"); r
 // B70, 4-token windows, split on: 16 lanes reads Q4_K/Q5_1 experts at 439 GB/s against 426 at 8; the reduction order differs
 // (other bits), so it stays opt-in.
 inline int kq_gu_lanes() { static const int v = std::getenv("STRATA_KQ_GU_LANES") ? lanes_env("STRATA_KQ_GU_LANES") : gu_lanes(); return v; }
+// night lab STRATA_NIGHT_EP_ROWS=2: the multi-row grouped kernels (native_gu_kernel_rows / native_down_kernel_rows)
+int night_ep_rows() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_NIGHT_EP_ROWS");
+        const int n = e ? std::atoi(e) : 0;
+        const int r = n == 2 ? 2 : 0;   // 4 measured slower than 2 (gate/up) and no better (down)
+        if (r) std::fprintf(stderr, "strata night: STRATA_NIGHT_EP_ROWS=%d (grouped expert lanes compute %d rows each)\n", r, r);
+        return r;
+    }();
+    return v;
+}
+int g_night_rows_force = -1;   // the bench: >= 0 overrides the environment (set before capture)
+inline int night_rows_now() { return g_night_rows_force >= 0 ? g_night_rows_force : night_ep_rows(); }
+template <int TG, int LN, int RPL>
+void launch_gu_rows_k(unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
+                      const int32_t *n_groups, const int32_t *ent_tok, const block_q8_1 *X,
+                      const NativeExpertLayout &L, float *gate, float *up) {
+    constexpr int ROWS = (256 / LN) * RPL;
+    const unsigned gx = (unsigned) ((2 * L.n_ff + ROWS - 1) / ROWS);
+    auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+    s->parallel_for<dpct_kernel_name<class native_gu_rows, dpct_kernel_scalar<TG>, dpct_kernel_scalar<LN>, dpct_kernel_scalar<RPL>>>(
+        sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
+        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
+            native_gu_kernel_rows<TG, LN, RPL>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        });
+}
+template <int TG, int LN, bool MULTI_OK>
+bool launch_gu_rows(unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
+                    const int32_t *n_groups, const int32_t *ent_tok, const block_q8_1 *X,
+                    const NativeExpertLayout &L, float *gate, float *up) {
+    if constexpr (!MULTI_OK || LN > 16) { return false; }
+    else {
+        const int rpl = night_rows_now();
+        if (rpl == 2) launch_gu_rows_k<TG, LN, 2>(groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        else return false;
+        return true;
+    }
+}
+template <int TD, int LN, int RPL>
+void launch_down_rows_k(unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
+                        const int32_t *n_groups, const int32_t *ent_dst, const block_q8_1 *hq,
+                        const NativeExpertLayout &L, float *out) {
+    constexpr int ROWS = (256 / LN) * RPL;
+    const unsigned gx = (unsigned) ((L.n_embd + ROWS - 1) / ROWS);
+    auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+    s->parallel_for<dpct_kernel_name<class native_down_rows, dpct_kernel_scalar<TD>, dpct_kernel_scalar<LN>, dpct_kernel_scalar<RPL>>>(
+        sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
+        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
+            native_down_kernel_rows<TD, LN, RPL>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        });
+}
+template <int TD, int LN>
+bool launch_down_rows(unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
+                      const int32_t *n_groups, const int32_t *ent_dst, const block_q8_1 *hq,
+                      const NativeExpertLayout &L, float *out) {
+    if constexpr (!Multi<TD>::has || LN > 16) { return false; }
+    else {
+        const int rpl = night_rows_now();
+        if (rpl == 2) launch_down_rows_k<TD, LN, 2>(groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        else return false;
+        return true;
+    }
+}
 template <int TG, int LN, bool KM = true>
 void launch_gu_port(unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
                     const int32_t *n_groups, const int32_t *ent_tok, const block_q8_1 *X,
                     const NativeExpertLayout &L, float *gate, float *up) {
+    if (launch_gu_rows<TG, LN, Multi<TG>::has>(groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up)) return;
     constexpr int ROWS = 256 / LN;
     const unsigned gx = (unsigned) ((2 * L.n_ff + ROWS - 1) / ROWS);
     auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
@@ -4423,6 +4638,7 @@ template <int TD, int LN, bool KM = true>
 void launch_down_port(unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
                       const int32_t *n_groups, const int32_t *ent_dst, const block_q8_1 *hq,
                       const NativeExpertLayout &L, float *out) {
+    if (launch_down_rows<TD, LN>(groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out)) return;
     constexpr int ROWS = 256 / LN;
     const unsigned gx = (unsigned) ((L.n_embd + ROWS - 1) / ROWS);
     auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
@@ -4522,6 +4738,7 @@ void launch_down(dpct::dim3 grid, dpct::queue_ptr s,
 }  // namespace
 
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
+void native_expert_set_night_rows(int rpl) { g_night_rows_force = rpl; }
 void native_expert_set_kq_split(bool on) { g_kq_split = on; }
 bool iq_old_kernels() { return g_old_kernels; }
 

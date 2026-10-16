@@ -87,6 +87,8 @@ void native_expert_set_mode(int mode, int phase);
 /// true selects the older kernels that decode it again per column (STRATA_OLD_IQ_MMVQ=1 at startup).  Both give
 /// bitwise the same results.  Set before graph capture; captured graphs keep the kernels they captured.
 void iq_set_old_kernels(bool old);
+/// night lab bench: the STRATA_NIGHT_EP_ROWS kernels with rpl rows per lane (2; 0 off; -1 the environment's)
+void native_expert_set_night_rows(int rpl);
 bool iq_old_kernels();
 
 }  // namespace strata::kernels

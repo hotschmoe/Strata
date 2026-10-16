@@ -59,6 +59,7 @@ struct VerifyEp {
     const uint8_t* cache_base1 = nullptr;            ///< the peer's expert arena
     const unsigned long long* slot_off1 = nullptr;   ///< the peer's per-slot offsets, its memory (null: slot * blob1)
     int64_t blob1 = 0;
+    const unsigned long long* slot_off1_on0 = nullptr;   ///< night lab STRATA_NIGHT_EP_PLAN1: slot_off1, a copy here
 };
 
 struct VerifyHits {
@@ -384,6 +385,19 @@ private:
     const bool ep_verify_ = [] { const char* v = std::getenv("STRATA_EP_VERIFY"); return v && v[0] == '1'; }();
     uint32_t ep_spin_ = 2000000u;                     ///< STRATA_EP_SPIN_MAX: reads before a wait gives up
     size_t ep_slot_bytes_ = 0, ep_xq_off_ = 0;        ///< inbox: bytes per group, offset of the q8_1 rows
+    /// night lab STRATA_NIGHT_EP_PSUM=1 (default off): the inbox also carries the routing weights (at ep_w_off_) and
+    /// the peer returns one weighted-sum row per token into ep_psum_ (an EpRegion on this card) instead of a row per entry
+    bool ep_psum_ = false;
+    /// night lab STRATA_NIGHT_EP_PLAN1=1: card 0 makes card 1's plan too (resident_plan_ep_pair) and pushes it in the
+    /// inbox slot (at ep_plan_off_, ep_plan_words_ words); card 1 skips its resident_plan_ep
+    bool ep_plan1_on_ = false;
+    size_t ep_plan_off_ = 0;
+    int ep_plan_words_ = 0;
+    int32_t* ep_plan1_on0_ = nullptr;                 ///< card 1's plans as card 0 makes them (two groups), card 0
+    size_t ep_w_off_ = 0;
+    void* ep_psum_reg_ = nullptr;
+    float* ep_psum0_ = nullptr;                       ///< this card's address
+    float* ep_psum_on1_ = nullptr;                    ///< the peer's address
     dpct::experimental::command_graph_exec_ptr ep_exec_[9] = {};   ///< the peer's graph per window size
     std::map<std::vector<int>, dpct::experimental::command_graph_exec_ptr> ep_exec_bm_;   ///< ... per batch row layout
     bool ep_init(std::string& err);

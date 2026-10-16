@@ -2471,6 +2471,23 @@ void resident_plan_ep(const int32_t* ids, int n_entries, int k, const int32_t* r
     }
     check("resident_plan_ep");
 }
+void resident_plan_ep_pair(const int32_t* ids, int n_entries, int k, const int32_t* res0, const int32_t* res1,
+                           int n_expert, const uint8_t* cache_base0, const unsigned long long* slot_off0, long long blob0,
+                           int32_t* plan0, const uint8_t* cache_base1, const unsigned long long* slot_off1,
+                           long long blob1, int32_t* plan1, long long capx, void* stream, uint32_t* plan_err) {
+    auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+    strata::q_of(stream)->parallel_for<dpct_kernel_name<class resident_plan_ep_pair_kernel>>(
+        sycl::nd_range<3>(sycl::range(1, 1, 2 * kResidentPlanMax), sycl::range(1, 1, kResidentPlanMax)), exp_props,
+        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+            if (item_ct1.get_group(2) == 0)   // card 0's own entries (role 1)
+                resident_plan_kernel(ids, n_entries, k, res0, n_expert, cache_base0, slot_off0, blob0, plan0, capx,
+                                     nullptr, 0, nullptr, plan_err, nullptr, res1, 1);
+            else                              // card 1's (role 2), its addresses
+                resident_plan_kernel(ids, n_entries, k, res1, n_expert, cache_base1, slot_off1, blob1, plan1, capx,
+                                     nullptr, 0, nullptr, plan_err, nullptr, res0, 2);
+        });
+    check("resident_plan_ep_pair");
+}
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
     const uint32_t spin_max = strata::spin_max(*strata::q_of(stream));
     {
