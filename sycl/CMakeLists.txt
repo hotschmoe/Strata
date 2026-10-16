@@ -386,6 +386,8 @@ if(STRATA_SYCL_PARITY)
   target_link_libraries(dense_bench PRIVATE strata_kernels)
   add_executable(night_mmvq_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/night_mmvq_bench.cpp)   # STRATA_NIGHT_MMVQ A/B
   target_link_libraries(night_mmvq_bench PRIVATE strata_kernels)
+  add_executable(night_shexp_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/night_shexp_bench.cpp)   # STRATA_NIGHT_SHEXP A/B
+  target_link_libraries(night_shexp_bench PRIVATE strata_kernels)
   add_executable(mmvq_sg_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mmvq_sg_bench.cpp)   # SIMD16 vs 32 decode mmvq
   target_link_libraries(mmvq_sg_bench PRIVATE strata_kernels)
   add_executable(q6k_align_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/q6k_align_bench.cpp)   # Q6_K block alignment

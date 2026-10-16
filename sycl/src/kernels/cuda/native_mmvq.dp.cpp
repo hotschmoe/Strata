@@ -46,6 +46,7 @@
 #include <type_traits>
 #include <string>
 #include <unordered_map>
+#include <mutex>
 #include <cstdio>
 #include <vector>
 #include <cmath>
@@ -3064,8 +3065,6 @@ void night_iq3s_dispatch(const void* w, const void* x, float* y, int n_in, int n
     else launch_night_kreg2<F, NCOLS, 8, 256>(w, x, y, n_in, n_out, s);
 }
 bool try_night_iq3s(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* stream) {
-    static const int iq3s_minc = [] { const char* e = std::getenv("STRATA_NIGHT_IQ3S_MINC"); return e ? std::atoi(e) : 5; }();
-    if (ncols < iq3s_minc) return false;   // in-engine A/B: the night IQ3_S kernel loses at C1 (<= 4 columns)
     if (!night_mmvq2_on() || !(night_mmvq2_mask() & 2) || !w || !x || !y || !stream || ncols < 1 || ncols > 8 || n_out <= 0 || n_in <= 0 ||
         n_in % QK != 0 || n_in > 32768 || (reinterpret_cast<uintptr_t>(w) & 1u) || (reinterpret_cast<uintptr_t>(x) & 3u)) return false;
     const auto s = strata::q_of(stream);
@@ -3097,6 +3096,361 @@ bool try_night_iq4nl(const void* w, const void* x, float* y, int n_in, int n_out
         default: launch_night_kreg2<F, 8, 4, 128>(w, x, y, n_in, n_out, s); return true;
     }
 }
+
+// ---------------------------------------------------------------- night: STRATA_NIGHT_SHEXP=1 fused shared expert
+// (1) gate + up in ONE launch: both matrices' K-split KREG tiles in one group (each matrix keeps its own format's
+// lanes/activations - shared when gate and up have the same type), so every (row, column) sum is the same bits as the
+// separate night KREG calls. The epilogue computes h = silu(gate) * up (native_swiglu_quantize_q8_1's expression) and
+// stores it; the LAST group to finish a 32-row chunk (device-scope atomic counter per chunk, self-resetting) quantizes
+// that chunk into Q8_1 (same q bytes and d as native_swiglu_quantize_q8_1; ds.y summed in another order).
+// (2) the down projection with the shared-gate sigmoid scale in its epilogue (s * (1 / (1 + exp(-g))), as
+// launch_sigmoid_scale_rows), so the shared expert is 3 launches (gate+up, bf16 gate row, down) instead of 6.
+// The shared gate row (ffn_gate_inp_shexp, BF16, n_out = 1) bit for bit as bf16_f32_mmvf_kernel<BLOCK> (and its multi-row
+// form, which keeps each row's order): virtual thread t of BLOCK accumulates pairs t, t + BLOCK, ... with two ordered
+// fmas; each 32-thread warp's xor butterfly is replayed in its exact operand order (own + partner), then the
+// partials[32] (BLOCK/32 values, zeros after) butterfly. Done by one extra group of the gate+up launch.
+__dpct_inline__ float night_xor32_lane0(float* v) {   // lane 0's value after the 16, 8, 4, 2, 1 xor butterfly (in place)
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        for (int i = 0; i < o; ++i) v[i] = v[i] + v[i + o];
+    return v[0];
+}
+// one column per extra group (the row loop's loads hoisted: at most 8 pairs per virtual thread, n_in <= 16 * block)
+void night_shexp_gate_row(const float* __restrict__ xf, int ldx, const uint16_t* __restrict__ wrow, float* __restrict__ graw,
+                          int n_in, int block, int j, float* __restrict__ slm) {
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<1>();
+    const int lid = int(it.get_local_id(0)), nl = int(it.get_local_range(0));
+    const uint32_t* w2 = reinterpret_cast<const uint32_t*>(wrow);
+    const sycl::float2* in2 = reinterpret_cast<const sycl::float2*>(xf + std::size_t(j) * ldx);
+    const int npairs = n_in / 2;
+    for (int t = lid; t < block; t += nl) {
+        uint32_t wt[8]; sycl::float2 in[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int pair = t + i * block;
+            const bool ok = pair < npairs;
+            wt[i] = ok ? w2[pair] : 0u; in[i] = ok ? in2[pair] : sycl::float2(0.0f, 0.0f);
+        }
+        float acc = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            if (t + i * block < npairs) {
+                acc = sycl::fma(sycl::bit_cast<float>(uint32_t(wt[i] & 0xFFFFu) << 16), in[i].x(), acc);
+                acc = sycl::fma(sycl::bit_cast<float>(uint32_t(wt[i] >> 16) << 16), in[i].y(), acc);
+            }
+        }
+        slm[t] = acc;
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+    const int nw = block / 32;
+    float* part = slm + block;   // [32]
+    if (lid < 32) {
+        float v[32];
+        if (lid < nw) {
+            for (int i = 0; i < 32; ++i) v[i] = slm[lid * 32 + i];
+            part[lid] = night_xor32_lane0(v);
+        } else part[lid] = 0.0f;
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+    if (lid == 0) {
+        float v[32];
+        for (int i = 0; i < 32; ++i) v[i] = part[i];
+        graw[j] = night_xor32_lane0(v);
+    }
+}
+template <typename FG, typename FU> constexpr int shexp_tw() { return FG::kTableWords + (std::is_same_v<FG, FU> ? 0 : FU::kTableWords); }
+template <typename FG, typename FU, int NCOLS, int R>
+void night_shexp_gu_kernel(const typename FG::Block* __restrict__ wg, const typename FU::Block* __restrict__ wu,
+                           const Q81Block* __restrict__ x, float* __restrict__ h, Q81Block* __restrict__ q8,
+                           uint32_t* __restrict__ counters, int n_in, int n_ff, float* __restrict__ slm, int diag,
+                           const float* __restrict__ xf, const uint16_t* __restrict__ wrow, float* __restrict__ graw, int gblock) {
+    constexpr bool SAME = std::is_same_v<FG, FU>;
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<1>();
+    if (int(it.get_group(0)) >= n_ff / R) { night_shexp_gate_row(xf, n_in, wrow, graw, n_in, gblock, int(it.get_group(0)) - n_ff / R, slm); return; }
+    const sycl::sub_group sg = it.get_sub_group();
+    constexpr int P0 = 2 * R * NCOLS, P = (P0 + NIGHT_SG - 1) / NIGHT_SG * NIGHT_SG, PL = P / NIGHT_SG;
+    const int lid = int(it.get_local_id(0)), lane = int(sg.get_local_linear_id()), sgi = lid / NIGHT_SG;
+    const int nl = int(it.get_local_range(0)), nsg = nl / NIGHT_SG;
+    const int bpr = n_in / QK, x_stride = n_in / Q8K;
+    const bool live = (lid >> 3) < bpr;
+    const int kb = live ? (lid >> 3) : 0, g = lid & 7;
+    float* red = slm;                                        // P floats per sub-group
+    float* hs = slm + nsg * P;                               // the tile's gate/up sums (P0)
+    uint32_t* tw = reinterpret_cast<uint32_t*>(slm + nsg * P + P0 + 2 * NCOLS + 1);
+    const uint32_t* tg = nullptr; const uint32_t* tu = nullptr;
+    if constexpr (shexp_tw<FG, FU>() > 0) {
+        for (int i = lid; i < FG::kTableWords; i += nl) tw[i] = FG::table_entry(i);
+        if constexpr (!SAME) for (int i = lid; i < FU::kTableWords; i += nl) tw[FG::kTableWords + i] = FU::table_entry(i);
+        it.barrier(sycl::access::fence_space::local_space);
+        tg = tw; tu = SAME ? tw : tw + FG::kTableWords;
+    }
+    typename FG::A ag[NCOLS];
+    typename FU::A au[SAME ? 1 : NCOLS];
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        ag[j] = FG::act(x + std::size_t(j) * x_stride + kb * (QK / Q8K), g);
+        if (!live) ag[j] = typename FG::A{};
+        if constexpr (!SAME) { au[j] = FU::act(x + std::size_t(j) * x_stride + kb * (QK / Q8K), g); if (!live) au[j] = typename FU::A{}; }
+    }
+    const int row0 = int(it.get_group(0)) * R;               // n_ff % 32 == 0 and R | 32: every tile is whole
+    float v[P];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        typename FG::W w0; typename FU::W w1;
+        if constexpr (FG::kTableWords > 0) w0 = FG::load(wg + std::size_t(row0 + r) * bpr + kb, g, tg);
+        else w0 = FG::load(wg + std::size_t(row0 + r) * bpr + kb, g);
+        if constexpr (FU::kTableWords > 0) w1 = FU::load(wu + std::size_t(row0 + r) * bpr + kb, g, tu);
+        else w1 = FU::load(wu + std::size_t(row0 + r) * bpr + kb, g);
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+            v[r * NCOLS + j] = FG::dot(w0, ag[j]);
+            if constexpr (SAME) v[(R + r) * NCOLS + j] = FU::dot(w1, ag[j]);
+            else v[(R + r) * NCOLS + j] = FU::dot(w1, au[j]);
+        }
+    }
+#pragma unroll
+    for (int k = P0; k < P; ++k) v[k] = 0.0f;
+    night_tsum<NIGHT_SG / 2, P, P>(v, sg, lane);
+#pragma unroll
+    for (int i = 0; i < PL; ++i) red[sgi * P + lane * PL + i] = v[i];
+    it.barrier(sycl::access::fence_space::local_space);
+    for (int k = lid; k < P0; k += nl) {
+        float s = 0.0f;
+        for (int q = 0; q < nsg; ++q) s += red[q * P + k];
+        hs[k] = s;
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+    for (int k = lid; k < R * NCOLS; k += nl) {
+        const int r = k / NCOLS, j = k % NCOLS;
+        const float gi = hs[k], ui = hs[R * NCOLS + k];
+        h[std::size_t(j) * n_ff + row0 + r] = gi / (1.0f + sycl::native::exp(-gi)) * ui;
+    }
+    if (!(diag & 2)) return;   // default: the caller quantizes h (native_quantize_q8_1); STRATA_NIGHT_SHEXP=2: handoff here
+    // grid handoff: the last group of this 32-row chunk quantizes it
+    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+    it.barrier(sycl::access::fence_space::global_and_local);
+    const int chunk = row0 / Q8K;
+    uint32_t* flag = reinterpret_cast<uint32_t*>(hs + P0 + 2 * NCOLS);
+    if (lid == 0) {
+        sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device, sycl::access::address_space::global_space>
+            c(counters[chunk]);
+        const uint32_t old = c.fetch_add(1u);
+        const bool last = old == uint32_t(Q8K / R - 1);
+        if (last) c.store(0u);   // self-reset for the next launch (every group of the chunk has arrived)
+        *flag = last ? 1u : 0u;
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+    if (*flag == 0u) return;
+    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+    float* am = hs;   // reuse: [2][NCOLS] amax and sums of the chunk's two 16-lane halves
+    float xi[NCOLS];
+    if (lid < Q8K) {
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) xi[j] = h[std::size_t(j) * n_ff + chunk * Q8K + lid];
+    }
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        const float a = lid < Q8K ? sycl::fabs(xi[j]) : 0.0f, sx = lid < Q8K ? xi[j] : 0.0f;
+        const float ma = sycl::reduce_over_group(sg, a, sycl::maximum<float>());
+        const float su = sycl::reduce_over_group(sg, sx, sycl::plus<float>());
+        if (lane == 0 && sgi < 2) { am[sgi * NCOLS + j] = ma; am[2 * NCOLS + sgi * NCOLS + j] = su; }
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+    if (lid < Q8K) {
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+            const float amax = sycl::fmax(am[j], am[NCOLS + j]);
+            const float d = q8_1_finite(amax / 127.0f);   // as native_swiglu_quantize_q8_1_kernel
+            Q81Block* b = q8 + std::size_t(j) * (n_ff / Q8K) + chunk;
+            b->qs[lid] = q8_1_quant(xi[j], d, amax);
+            if (lid == 0) b->ds = q8_1_ds(d, am[2 * NCOLS + j] + am[3 * NCOLS + j]);
+        }
+    }
+}
+template <typename FG, typename FU, int NCOLS, int R, int GRF>
+void launch_night_shexp_gu(const void* wg, const void* wu, const void* x_q8_1, float* h, void* q8, uint32_t* counters,
+                           int n_in, int n_ff, dpct::queue_ptr s, const float* xf, const uint16_t* wrow, float* graw, int gblock) {
+    const auto* g = static_cast<const typename FG::Block*>(wg);
+    const auto* u = static_cast<const typename FU::Block*>(wu);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    auto* qo = static_cast<Q81Block*>(q8);
+    const int L = ((n_in / QK) * 8 + NIGHT_SG - 1) / NIGHT_SG * NIGHT_SG;
+    const int nsg = L / NIGHT_SG;
+    constexpr int P0 = 2 * R * NCOLS, P = (P0 + NIGHT_SG - 1) / NIGHT_SG * NIGHT_SG;
+    const int slm_floats = std::max(nsg * P + P0 + 2 * NCOLS + 1 + shexp_tw<FG, FU>() + 4 * NCOLS, wrow ? gblock + 32 : 0);
+    static const int diag_env = [] { const char* e = std::getenv("STRATA_NIGHT_SHEXP"); return e && e[0] == '2' ? 2 : 0; }();
+    const int diag = diag_env;   // a kernel may not reference a static
+    s->submit([&](sycl::handler& hd) {
+        sycl::local_accessor<float, 1> slm(sycl::range<1>(slm_floats), hd);
+        auto k = [=](sycl::nd_item<1>) [[sycl::reqd_sub_group_size(16)]] {
+            night_shexp_gu_kernel<FG, FU, NCOLS, R>(g, u, x, h, qo, counters, n_in, n_ff, slm.get_multi_ptr<sycl::access::decorated::no>().get(), diag,
+                                                    xf, wrow, graw, gblock);
+        };
+        const sycl::nd_range<1> nr(std::size_t(n_ff / R + (wrow ? NCOLS : 0)) * L, L);
+        if constexpr (GRF == 256)
+            hd.parallel_for<dpct_kernel_name<class night_shexp_gu_g, FG, FU, dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<R>>>(
+                nr, sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>}, k);
+        else
+            hd.parallel_for<dpct_kernel_name<class night_shexp_gu, FG, FU, dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<R>>>(nr, k);
+    });
+}
+template <typename FG, typename FU, int NCOLS>
+void night_shexp_gu_dispatch(const void* wg, const void* wu, const void* x, float* h, void* q8, uint32_t* c, int n_in, int n_ff, dpct::queue_ptr s,
+                             const float* xf, const uint16_t* wrow, float* graw, int gblock) {
+    if constexpr (std::is_same_v<FG, FU>) {
+        if constexpr (NCOLS <= 3) launch_night_shexp_gu<FG, FU, NCOLS, 2, 128>(wg, wu, x, h, q8, c, n_in, n_ff, s, xf, wrow, graw, gblock);
+        else launch_night_shexp_gu<FG, FU, NCOLS, 2, 256>(wg, wu, x, h, q8, c, n_in, n_ff, s, xf, wrow, graw, gblock);
+    } else {
+        if constexpr (NCOLS <= 2) launch_night_shexp_gu<FG, FU, NCOLS, 2, 128>(wg, wu, x, h, q8, c, n_in, n_ff, s, xf, wrow, graw, gblock);
+        else launch_night_shexp_gu<FG, FU, NCOLS, 2, 256>(wg, wu, x, h, q8, c, n_in, n_ff, s, xf, wrow, graw, gblock);   // NCOLS <= 4 (night_shexp_gu_run)
+    }
+}
+template <typename FG, typename FU>
+bool night_shexp_gu_cols(const void* wg, const void* wu, const void* x, float* h, void* q8, uint32_t* c, int n_in, int n_ff, int ncols, dpct::queue_ptr s,
+                         const float* xf, const uint16_t* wrow, float* graw, int gblock) {
+    static const int mixed_max = [] { const char* e = std::getenv("STRATA_NIGHT_SHEXP_MIXED_MAXC"); return e ? std::atoi(e) : 8; }();
+    if constexpr (!std::is_same_v<FG, FU>) {   // mixed formats: two activation sets (STRATA_NIGHT_SHEXP_MIXED_MAXC caps the width)
+        if (ncols > mixed_max) return false;
+        switch (ncols) {
+            case 1: night_shexp_gu_dispatch<FG, FU, 1>(wg, wu, x, h, q8, c, n_in, n_ff, s, xf, wrow, graw, gblock); return true;
+            case 2: night_shexp_gu_dispatch<FG, FU, 2>(wg, wu, x, h, q8, c, n_in, n_ff, s, xf, wrow, graw, gblock); return true;
+            case 3: night_shexp_gu_dispatch<FG, FU, 3>(wg, wu, x, h, q8, c, n_in, n_ff, s, xf, wrow, graw, gblock); return true;
+            case 4: night_shexp_gu_dispatch<FG, FU, 4>(wg, wu, x, h, q8, c, n_in, n_ff, s, xf, wrow, graw, gblock); return true;
+            case 5: night_shexp_gu_dispatch<FG, FU, 5>(wg, wu, x, h, q8, c, n_in, n_ff, s, xf, wrow, graw, gblock); return true;
+            case 6: night_shexp_gu_dispatch<FG, FU, 6>(wg, wu, x, h, q8, c, n_in, n_ff, s, xf, wrow, graw, gblock); return true;
+            case 7: night_shexp_gu_dispatch<FG, FU, 7>(wg, wu, x, h, q8, c, n_in, n_ff, s, xf, wrow, graw, gblock); return true;
+            case 8: night_shexp_gu_dispatch<FG, FU, 8>(wg, wu, x, h, q8, c, n_in, n_ff, s, xf, wrow, graw, gblock); return true;
+            default: return false;
+        }
+    }
+    switch (ncols) {
+        case 1: night_shexp_gu_dispatch<FG, FU, 1>(wg, wu, x, h, q8, c, n_in, n_ff, s, xf, wrow, graw, gblock); return true;
+        case 2: night_shexp_gu_dispatch<FG, FU, 2>(wg, wu, x, h, q8, c, n_in, n_ff, s, xf, wrow, graw, gblock); return true;
+        case 3: night_shexp_gu_dispatch<FG, FU, 3>(wg, wu, x, h, q8, c, n_in, n_ff, s, xf, wrow, graw, gblock); return true;
+        case 4: night_shexp_gu_dispatch<FG, FU, 4>(wg, wu, x, h, q8, c, n_in, n_ff, s, xf, wrow, graw, gblock); return true;
+        case 5: night_shexp_gu_dispatch<FG, FU, 5>(wg, wu, x, h, q8, c, n_in, n_ff, s, xf, wrow, graw, gblock); return true;
+        case 6: night_shexp_gu_dispatch<FG, FU, 6>(wg, wu, x, h, q8, c, n_in, n_ff, s, xf, wrow, graw, gblock); return true;
+        case 7: night_shexp_gu_dispatch<FG, FU, 7>(wg, wu, x, h, q8, c, n_in, n_ff, s, xf, wrow, graw, gblock); return true;
+        default: night_shexp_gu_dispatch<FG, FU, 8>(wg, wu, x, h, q8, c, n_in, n_ff, s, xf, wrow, graw, gblock); return true;
+    }
+}
+// the (gate, up) type pairs of the Flash-Next ISTA IQ3_XXS pack (13 pairs over 48 layers); others take the old path
+bool night_shexp_gu_run(int tg, int tu, const void* wg, const void* wu, const void* x, float* h, void* q8, uint32_t* c,
+                        int n_in, int n_ff, int ncols, dpct::queue_ptr s, const float* xf, const uint16_t* wrow, float* graw, int gblock) {
+#define STRATA_SHGU(A, B, FA, FB) if (tg == A && tu == B) return night_shexp_gu_cols<FA, FB>(wg, wu, x, h, q8, c, n_in, n_ff, ncols, s, xf, wrow, graw, gblock);
+    STRATA_SHGU(12, 12, NightQ4K, NightQ4K) STRATA_SHGU(12, 13, NightQ4K, NightQ5K) STRATA_SHGU(12, 21, NightQ4K, NightIQ3S)
+    STRATA_SHGU(12, 23, NightQ4K, NightIQ4XS) STRATA_SHGU(13, 12, NightQ5K, NightQ4K) STRATA_SHGU(14, 21, NightQ6K, NightIQ3S)
+    STRATA_SHGU(21, 12, NightIQ3S, NightQ4K) STRATA_SHGU(21, 21, NightIQ3S, NightIQ3S) STRATA_SHGU(21, 23, NightIQ3S, NightIQ4XS)
+    STRATA_SHGU(23, 12, NightIQ4XS, NightQ4K) STRATA_SHGU(23, 14, NightIQ4XS, NightQ6K) STRATA_SHGU(23, 21, NightIQ4XS, NightIQ3S)
+    STRATA_SHGU(23, 23, NightIQ4XS, NightIQ4XS)
+#undef STRATA_SHGU
+    return false;
+}
+// Q2_0 (64-value blocks, 18 bytes): lane q of a block = Q20Traits' iqs = the block's q-th Q8_1 block; Q20Traits'
+// load and dot expression (integer dp4a order, d2 * d8 * sumi)
+struct NightQ20 {
+    using Block = Q20Block;
+    static constexpr int LPB = 2, EB = 64, kTableWords = 0;
+    static uint32_t table_entry(int) { return 0; }
+    struct A { int u[8]; float ds; };
+    using W = Q20Traits::W;
+    static A act(const Q81Block* xb, int q) {
+        A a; const int* q8 = reinterpret_cast<const int*>(xb[q].qs);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) a.u[i] = q8[i];
+        a.ds = xb[q].ds[0];
+        return a;
+    }
+    static W load(const Block* b, int q, const uint32_t*) { return Q20Traits::load(b, q); }
+    static float dot(const W& r, const A& a) {
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            sumi = STRATA_DP4A(a.u[j * 2], r.qx[j], sumi);
+            sumi = STRATA_DP4A(a.u[j * 2 + 1], r.qy[j], sumi);
+        }
+        return r.d2 * a.ds * sumi;
+    }
+};
+// down (IQ4_NL / Q2_0, n_in <= 1024: night_kreg2_kernel's mapping) with the optional shared-gate sigmoid scale per column
+template <typename F, int NCOLS, int R>
+void night_shexp_down_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x, const float* __restrict__ graw,
+                             float* __restrict__ y, int n_in, int n_out, float* __restrict__ slm) {
+    constexpr int LPB = lpb_of<F>(), EB = eb_of<F>();
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<1>();
+    const sycl::sub_group sg = it.get_sub_group();
+    constexpr int P0 = R * NCOLS, P = night_p<R, NCOLS>(), PL = P / NIGHT_SG;
+    const int lid = int(it.get_local_id(0)), lane = int(sg.get_local_linear_id()), sgi = lid / NIGHT_SG;
+    const int nsg = int(it.get_local_range(0)) / NIGHT_SG;
+    const int bpr = n_in / EB, x_stride = n_in / Q8K;
+    const bool live = lid / LPB < bpr;
+    const int kb = live ? lid / LPB : 0, q = lid % LPB;
+    typename F::A a[NCOLS];
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        a[j] = F::act(x + std::size_t(j) * x_stride + kb * (EB / Q8K), q);
+        if (!live) a[j] = typename F::A{};
+    }
+    const int ntiles = (n_out + R - 1) / R;
+    int buf = 0;
+    for (int t = int(it.get_group(0)); t < ntiles; t += int(it.get_group_range(0))) {
+        const int row0 = t * R;
+        const typename F::Block* wt = w + std::size_t(row0) * bpr + kb;
+        const int rlast = n_out - 1 - row0;
+        typename F::W wv[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) wv[r] = F::load(wt + (r < rlast ? r : rlast) * bpr, q, nullptr);
+        float v[P];
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) v[r * NCOLS + j] = F::dot(wv[r], a[j]);
+#pragma unroll
+        for (int k = P0; k < P; ++k) v[k] = 0.0f;
+        night_tsum<NIGHT_SG / 2, P, P>(v, sg, lane);
+        float* bb = slm + buf * nsg * P;
+#pragma unroll
+        for (int i = 0; i < PL; ++i) bb[sgi * P + lane * PL + i] = v[i];
+        it.barrier(sycl::access::fence_space::local_space);
+        for (int k = lid; k < P0; k += int(it.get_local_range(0))) {
+            float s = 0.0f;
+            for (int qq = 0; qq < nsg; ++qq) s += bb[qq * P + k];
+            const int r = k / NCOLS, j = k % NCOLS;
+            if (graw) s *= 1.0f / (1.0f + sycl::native::exp(-graw[j]));   // launch_sigmoid_scale_rows' factor
+            if (row0 + r < n_out) y[std::size_t(j) * n_out + row0 + r] = s;
+        }
+        buf ^= 1;
+    }
+}
+template <typename F, int NCOLS>
+void launch_night_shexp_down(const void* wd, const void* q8, const float* graw, float* y, int n_in, int n_out, dpct::queue_ptr s) {
+    constexpr int R = 4;
+    const auto* w = static_cast<const F::Block*>(wd);
+    const auto* x = static_cast<const Q81Block*>(q8);
+    const int L = ((n_in / eb_of<F>()) * lpb_of<F>() + NIGHT_SG - 1) / NIGHT_SG * NIGHT_SG;
+    const int nsg = L / NIGHT_SG;
+    constexpr int P = night_p<R, NCOLS>();
+    const int tiles = (n_out + R - 1) / R;
+    s->submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> slm(sycl::range<1>(2 * nsg * P), h);
+        h.parallel_for<dpct_kernel_name<class night_shexp_down, F, dpct_kernel_scalar<NCOLS>>>(
+            sycl::nd_range<1>(std::size_t(tiles) * L, L), [=](sycl::nd_item<1>) [[sycl::reqd_sub_group_size(16)]] {
+                night_shexp_down_kernel<F, NCOLS, R>(w, x, graw, y, n_in, n_out, slm.get_multi_ptr<sycl::access::decorated::no>().get());
+            });
+    });
+}
+inline bool night_shexp_on_env() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_NIGHT_SHEXP");
+        const bool on = e && (e[0] == '1' || e[0] == '2');
+        if (on) std::fprintf(stderr, "strata night shexp: enabled=1 fused shared expert (gate+up+swiglu one launch, down+sigmoid scale; =2: in-kernel q8 handoff)\n");
+        return on;
+    }();
+    return v;
+}
+int g_night_shexp_override = -1;
+std::mutex& night_shexp_mutex() { static std::mutex m; return m; }
+std::unordered_map<const void*, uint32_t*>& night_shexp_counters() { static std::unordered_map<const void*, uint32_t*> m; return m; }
 
 // SYCL port: wide kernels for the 32-element formats Q8_0 (34-byte blocks) and IQ4_NL (18). Both are only 2-byte
 // aligned, so the weights come through load16_a2 (page-safe). Q8_0: 2 lanes per block (16 quants each), 16 blocks
@@ -4165,6 +4519,72 @@ void native_q6_k_unpack(const void* weights) {
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
 void native_mmvq_set_q6k_wide(bool on) { g_q6k_wide = on; }
 void native_mmvq_set_night(int on) { g_night_mmvq_override = on; }   // bench toggle: -1 = STRATA_NIGHT_MMVQ
+// STRATA_NIGHT_SHEXP: the shared expert's fused launches (called from shared_expert_multi; extern-declared there)
+void night_shexp_set(int on) { g_night_shexp_override = on; }   // bench toggle: -1 = the env latch
+bool night_shexp_enabled() { return g_night_shexp_override >= 0 ? g_night_shexp_override != 0 : night_shexp_on_env(); }
+bool night_shexp_gu_swiglu_q8(int gate_type, const void* wg, int up_type, const void* wu, const void* x_q8_1, float* h,
+                              void* q8, int n_embd, int n_ff, int ncols, void* stream, const float* xf, const uint16_t* wrow,
+                              float* graw) {
+    // wrow (optional): the shared gate row, computed by one extra group into graw (bf16_gemv_fp32_mmvf's bits)
+    int gblock = 32;
+    if (wrow) {   // mmvf_block_size
+        int64_t best_it = (n_embd + 63) / 64;
+        for (int cand = 64; cand <= 256; cand += 32) {
+            const int64_t its = (n_embd + 2 * cand - 1) / (2 * cand);
+            if (its < best_it) { best_it = its; gblock = cand; }
+        }
+        if (!xf || !graw || (n_embd & 1) || gblock <= 32 || n_embd > 16 * gblock || (reinterpret_cast<uintptr_t>(xf) & 7u) ||
+            (reinterpret_cast<uintptr_t>(wrow) & 3u)) return false;
+    }
+    if (!wg || !wu || !x_q8_1 || !h || !q8 || !stream || ncols < 1 || ncols > 8 || n_embd % QK != 0 || n_embd > 32768 ||
+        n_ff <= 0 || n_ff % Q8K != 0) return false;
+    auto aligned = [](int t, const void* p) {
+        const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+        return (t == 12 || t == 13) ? (a & 15u) == 0 : t == 23 ? (a & 7u) == 0 : (a & 1u) == 0;
+    };
+    if (!aligned(gate_type, wg) || !aligned(up_type, wu) || (reinterpret_cast<uintptr_t>(x_q8_1) & 3u) != 0) return false;
+    const auto s = strata::q_of(stream);
+    static const bool handoff_mode = [] { const char* e = std::getenv("STRATA_NIGHT_SHEXP"); return e && e[0] == '2'; }();
+    if (handoff_mode && q8 == x_q8_1) return false;   // the in-kernel handoff would overwrite the input other groups read
+    uint32_t* counters = nullptr;
+    if (handoff_mode) {
+        std::lock_guard<std::mutex> lk(night_shexp_mutex());
+        auto& m = night_shexp_counters();
+        auto itc = m.find(h);
+        if (itc == m.end()) {   // one zeroed counter per 32-row chunk, per scratch buffer; self-resetting afterwards
+            counters = sycl::malloc_device<uint32_t>(4096, *s);
+            sycl::queue z(s->get_context(), s->get_device());
+            z.memset(counters, 0, 4096 * sizeof(uint32_t)).wait();
+            m[h] = counters;
+        } else counters = itc->second;
+    }
+    if (n_ff / Q8K > 4096) return false;
+    if (!night_shexp_gu_run(gate_type, up_type, wg, wu, x_q8_1, h, q8, counters, n_embd, n_ff, ncols, s, xf, wrow, graw, gblock)) return false;
+    static const bool handoff = [] { const char* e = std::getenv("STRATA_NIGHT_SHEXP"); return e && e[0] == '2'; }();
+    if (!handoff) native_quantize_q8_1(h, q8, n_ff, ncols, stream);   // h = swiglu(gate, up): the same bytes as the fused swiglu quantizer
+    launch_check();
+    return true;
+}
+bool night_shexp_down_scale(int down_type, const void* wd, const void* q8, const float* graw, float* out, int n_ff, int n_embd,
+                            int ncols, void* stream) {
+    if ((down_type != 20 && down_type != 42) || !wd || !q8 || !out || !stream || ncols < 1 || ncols > 8 ||
+        n_ff % (down_type == 42 ? 64 : 32) != 0 || n_ff > 1024 || n_embd <= 0 || (reinterpret_cast<uintptr_t>(wd) & 1u) != 0) return false;
+    const auto s = strata::q_of(stream);
+#define STRATA_SHD(F) switch (ncols) { \
+        case 1: launch_night_shexp_down<F, 1>(wd, q8, graw, out, n_ff, n_embd, s); break; \
+        case 2: launch_night_shexp_down<F, 2>(wd, q8, graw, out, n_ff, n_embd, s); break; \
+        case 3: launch_night_shexp_down<F, 3>(wd, q8, graw, out, n_ff, n_embd, s); break; \
+        case 4: launch_night_shexp_down<F, 4>(wd, q8, graw, out, n_ff, n_embd, s); break; \
+        case 5: launch_night_shexp_down<F, 5>(wd, q8, graw, out, n_ff, n_embd, s); break; \
+        case 6: launch_night_shexp_down<F, 6>(wd, q8, graw, out, n_ff, n_embd, s); break; \
+        case 7: launch_night_shexp_down<F, 7>(wd, q8, graw, out, n_ff, n_embd, s); break; \
+        default: launch_night_shexp_down<F, 8>(wd, q8, graw, out, n_ff, n_embd, s); break; }
+    if (down_type == 20) { STRATA_SHD(NightIQ4NL1) }
+    else { STRATA_SHD(NightQ20) }
+#undef STRATA_SHD
+    launch_check();
+    return true;
+}
 void native_q6_k_mmvq_stride224(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
                                 void* stream) {
     const auto s = strata::q_of(stream);

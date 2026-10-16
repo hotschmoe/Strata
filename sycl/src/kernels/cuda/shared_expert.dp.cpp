@@ -310,6 +310,14 @@ bool fused_swiglu_q81_enabled() {
 }
 }  // namespace
 
+// night STRATA_NIGHT_SHEXP=1 (native_mmvq.dp.cpp): gate + up + swiglu + q8_1 in one launch, down + sigmoid scale in one
+bool night_shexp_enabled();
+bool night_shexp_gu_swiglu_q8(int gate_type, const void* wg, int up_type, const void* wu, const void* x_q8_1, float* h,
+                              void* q8, int n_embd, int n_ff, int ncols, void* stream, const float* xf, const uint16_t* wrow,
+                              float* graw);
+bool night_shexp_down_scale(int down_type, const void* wd, const void* q8, const float* graw, float* out, int n_ff, int n_embd,
+                            int ncols, void* stream);
+
 void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
                          int64_t n_ff, void* stream, const void* x_q8_1_ready, int lfuse) {
@@ -322,6 +330,32 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     if (!x_q8_1) {
         native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
         x_q8_1 = nw.q8_1;
+    }
+    // night STRATA_NIGHT_SHEXP=1: 3 launches (gate+up+swiglu+q8, the bf16 gate row, down+sigmoid scale); the shared
+    // gate row runs before the down so the down's epilogue can scale. Falls through to the old path where unsupported.
+    static const bool batch_n = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
+    const bool gate_row = !gate_deferred && native_bf16 && (n_tok == 1 || batch_n);
+    if (night_shexp_enabled() && (gate_deferred || gate_row)) {
+        // the gate row rides in the fused launch (one extra group, the same bits as bf16_gemv_fp32_mmvf)
+        bool row_done = false;
+        if (night_shexp_gu_swiglu_q8(nw.gate_type, nw.gate_data, nw.up_type, nw.up_data, x_q8_1, gate, nw.q8_1, (int) n_embd,
+                                     (int) n_ff, n_tok, stream, gate_row ? x : nullptr, gate_row ? gate_inp_bf16 : nullptr, g)) {
+            row_done = gate_row;
+        } else {   // pair / width not fused: the old gate, up, swiglu+q8
+            native_mmvq(nw.gate_type, nw.gate_data, x_q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
+            native_mmvq(nw.up_type, nw.up_data, x_q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
+            native_swiglu_quantize_q8_1(gate, up, nw.q8_1, (int) n_ff, n_tok, stream);
+        }
+        if (gate_row && !row_done) {
+            if (n_tok > 1) bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);
+            else bf16_gemv_fp32_mmvf(x, gate_inp_bf16, g, n_embd, 1, stream);
+        }
+        if (!night_shexp_down_scale(nw.down_type, nw.down_data, nw.q8_1, gate_row ? g : nullptr, out, (int) n_ff,
+                                    (int) n_embd, n_tok, stream)) {
+            native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
+            if (gate_row) launch_sigmoid_scale_rows(out, g, (int) n_embd, n_tok, cs);
+        }
+        return;
     }
     // S26 STRATA_LFUSE (gate_deferred): gate and up in one launch where the pair applies (bitwise the two calls)
     if (!(pair && nw.gate_type == nw.up_type &&
