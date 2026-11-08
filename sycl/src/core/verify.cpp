@@ -2062,7 +2062,12 @@ bool Verifier::ep_init(std::string& err) {
     ep_rows0_ = (float*) parts->local;       ep_parts_on1_ = (float*) parts->remote;
     // the peer writes its rows straight into parts_; the two checks keep this card's own rows apart from them
     static const bool self = [] { const char* v = std::getenv("STRATA_EP_SELF"); return v && v[0] == '1'; }();
-    if (!ep_verify_ && !self) parts_ = ep_rows0_;
+    // Under STRATA_NIGHT_EP_PSUM the peer returns per-token sums into ep_psum0_ and never writes parts_, so this card's
+    // own rows stay in its own buffer. Aliasing parts_ to ep_rows0_ only works out when that region is this card's VRAM
+    // (the IPC path); where ep_region_alloc falls back to host USM every grouped launch writes its rows over PCIe and the
+    // combine reads them back. STRATA_EP_PARTS_HOST=1 restores the alias.
+    static const bool parts_host = [] { const char* v = std::getenv("STRATA_EP_PARTS_HOST"); return v && v[0] == '1'; }();
+    if (!ep_verify_ && !self && (!ep_psum_ || parts_host)) parts_ = ep_rows0_;
     if (ep_plan1_on_) {
         ep_plan1_on0_ = sycl::malloc_device<int32_t>((size_t) 2 * (plan_i32_ + 16), *cs_);
         if (ep_plan1_on0_ == nullptr) { err = "verify: expert parallel: plan buffer failed"; return false; }

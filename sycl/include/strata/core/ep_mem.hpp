@@ -53,6 +53,24 @@ inline bool ep_region_alloc(int owner, int other, size_t bytes, EpRegion& r, std
     return true;
 }
 
+/// `bytes` zeroed on dpct device `owner`, for the owner's own kernels only (remote stays null): a buffer that sits in the
+/// exchange machinery but is never read by the other card, so it needs no IPC handle (and, on a port where
+/// ep_region_alloc must fall back to host memory, stays in VRAM). Freed by ep_region_free like any region.
+inline bool ep_region_alloc_private(int owner, size_t bytes, EpRegion& r, std::string& err) {
+    r = EpRegion{};
+    r.owner_ctx = ep_ze_context(owner);
+    ze_device_mem_alloc_desc_t desc{};
+    desc.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC;
+    ze_result_t z = zeMemAllocDevice(r.owner_ctx, &desc, bytes, 4096, ep_ze_device(owner), &r.local);
+    if (z != ZE_RESULT_SUCCESS) {
+        err = "expert parallel: zeMemAllocDevice of " + std::to_string(bytes) + " bytes failed (" + std::to_string((unsigned) z) + ")";
+        r.local = nullptr;
+        return false;
+    }
+    dpct::dev_mgr::instance().get_device(owner).in_order_queue().memset(r.local, 0, bytes).wait();
+    return true;
+}
+
 inline void ep_region_free(EpRegion& r) {
     if (r.remote != nullptr) zeMemCloseIpcHandle(r.other_ctx, r.remote);
     if (r.local != nullptr) zeMemFree(r.owner_ctx, r.local);

@@ -2032,8 +2032,24 @@ bool Prefill::set_ep_peer(int device, core::ExpertCache* cache, std::string& err
     pp->reduce_rows = reduce && reduce[0] == '1';
     const char* push = std::getenv("STRATA_EP_PREFILL_PUSH");
     pp->reduce_push = pp->reduce_rows && push && push[0] == '1';
-    bool ok = core::ep_region_alloc(device, primary, (size_t) m.T_max * N * 2, pp->x_reg, err) &&
-              core::ep_region_alloc(device, primary, (size_t) m.T_max * K * N * 4, pp->rows_reg, err);
+    // With STRATA_EP_PREFILL_REDUCE card 1 sums its own rows and card 0 reads only the sums (sum_reg): rows_reg is then
+    // card 1's private buffer (its gathered inputs under the gather alias, and its experts' outputs). Keep it in card 1's
+    // VRAM without an IPC mapping: where ep_region_alloc has to give host memory (a port without Level Zero IPC, e.g.
+    // Windows) every expert GEMM read and wrote it over PCIe.
+    // STRATA_EP_PREFILL_ROWS_HOST=1 restores the shared region.
+    static const bool rows_host = [] { const char* v = std::getenv("STRATA_EP_PREFILL_ROWS_HOST"); return v && v[0] == '1'; }();
+    bool rows_private = pp->reduce_rows && !rows_host;
+    bool ok = core::ep_region_alloc(device, primary, (size_t) m.T_max * N * 2, pp->x_reg, err);
+    if (ok && rows_private && !core::ep_region_alloc_private(device, (size_t) m.T_max * K * N * 4, pp->rows_reg, err)) {
+        std::fprintf(stderr, "strata prefill: card 1's rows buffer does not fit in its VRAM (%s): shared region instead\n",
+                     err.c_str());
+        err.clear();
+        rows_private = false;
+    }
+    if (ok && !rows_private) ok = core::ep_region_alloc(device, primary, (size_t) m.T_max * K * N * 4, pp->rows_reg, err);
+    if (ok) std::fprintf(stderr, "strata prefill: expert parallel: card 1's rows buffer (%zu MiB) in %s%s\n",
+                         ((size_t) m.T_max * K * N * 4) >> 20, rows_private ? "its VRAM" : "the shared exchange region",
+                         rows_private ? "" : " (STRATA_EP_PREFILL_ROWS_HOST=1 or no reduce)");
     if (ok) pp->rows_bytes = (size_t) m.T_max * K * N * 4;
     if (ok && pp->reduce_rows)
         ok = core::ep_region_alloc(pp->reduce_push ? primary : device, pp->reduce_push ? device : primary,
